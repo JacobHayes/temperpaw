@@ -4,6 +4,7 @@
 os-apps/**/*.wasm
 .env
 .env.local
+*.local.md
 *.swp
 *.swo
 .DS_Store
