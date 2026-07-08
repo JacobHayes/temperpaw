@@ -480,6 +480,38 @@
     padding: 0;
   }
 
+  /* ── FAB ──
+     Defined ahead of the responsive media queries below so that the
+     mobile `.paw-fab { display: none; }` rule (same specificity) wins
+     the cascade on small viewports via source order, instead of being
+     silently overridden by this unconditional rule. On mobile the
+     bottom nav already exposes its own "Paw" toggle, so the FAB is
+     redundant there and, before this fix, would float on top of the
+     bottom nav and visually cover the Settings item. */
+  .paw-fab {
+    position: fixed;
+    bottom: calc(var(--sp-6) + env(safe-area-inset-bottom, 0px));
+    right: var(--sp-6);
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    background: var(--text-1);
+    color: var(--bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    z-index: 40;
+    border: none;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    transition: transform var(--duration) var(--ease), box-shadow var(--duration) var(--ease);
+  }
+
+  .paw-fab:hover {
+    transform: scale(1.1);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+  }
+
   /* ---- Tablet: collapse sidebar to icons ---- */
   @media (max-width: 768px) {
     .sidebar {
@@ -560,7 +592,7 @@
 
     .main {
       margin-left: 0;
-      margin-bottom: 64px;
+      margin-bottom: calc(64px + env(safe-area-inset-bottom, 0px));
       padding: var(--sp-4) var(--sp-4);
     }
 
@@ -570,35 +602,14 @@
 
     .main--canvas {
       padding: 0;
-      margin-bottom: 64px;
+      margin-bottom: calc(64px + env(safe-area-inset-bottom, 0px));
     }
 
+    /* The FAB duplicates the "Paw" bottom-nav item on mobile, so it's
+       hidden here. This selector has the same specificity as the base
+       `.paw-fab` rule above; because it's declared later in source
+       order, it correctly wins the cascade on mobile viewports. */
     .paw-fab { display: none; }
-  }
-
-  /* ── FAB ── */
-  .paw-fab {
-    position: fixed;
-    bottom: var(--sp-6);
-    right: var(--sp-6);
-    width: 48px;
-    height: 48px;
-    border-radius: 50%;
-    background: var(--text-1);
-    color: var(--bg);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    z-index: 40;
-    border: none;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-    transition: transform var(--duration) var(--ease), box-shadow var(--duration) var(--ease);
-  }
-
-  .paw-fab:hover {
-    transform: scale(1.1);
-    box-shadow: 0 4px 16px rgba(0,0,0,0.3);
   }
 
   /* ── Panel open adjustment ── */
