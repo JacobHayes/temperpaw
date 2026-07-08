@@ -315,6 +315,7 @@ export interface SetupStatus {
   has_personalized_soul: boolean;
   discord_connected: boolean;
   slack_connected: boolean;
+  discord_interaction_delivery: 'gateway' | 'webhook';
   discord_interaction_url?: string;
 }
 
@@ -508,8 +509,11 @@ export interface TransportStatusResponse {
   slack: { status: string; message?: string };
 }
 
+export type DiscordInteractionDelivery = 'gateway' | 'webhook';
+
 export interface DiscordConnectResponse {
   status: string;
+  discord_interaction_delivery?: DiscordInteractionDelivery;
   discord_interaction_url?: string;
 }
 
@@ -525,6 +529,7 @@ export async function connectDiscord(params: {
   guild_id?: string;
   feed_channel_id?: string;
   forum_channel_id?: string;
+  interaction_delivery?: DiscordInteractionDelivery;
 }): Promise<DiscordConnectResponse> {
   const res = await apiFetch(`${BASE}/paw/transports/discord/connect`, {
     method: 'POST',

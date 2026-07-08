@@ -35,10 +35,16 @@
     sensitive: boolean;
   }
 
+  type Feedback = { type: 'error' | 'success'; message: string };
+
   let loading = $state(true);
   let status = $state<SetupStatus | null>(null);
   let vars = $state<VarRow[]>([]);
-  let feedback = $state<{ type: 'error' | 'success'; message: string } | null>(null);
+  // Feedback is keyed by "slot" so each message renders inline next to the
+  // control that produced it (a provider card, a variable row, the add form,
+  // or the page itself) instead of one global banner at the top of the page.
+  let feedback = $state<Record<string, Feedback | null>>({});
+  const feedbackTimers: Record<string, ReturnType<typeof setTimeout>> = {};
 
   // Add variable form
   let addingVar = $state(false);
@@ -78,7 +84,6 @@
   let showApiKey = $state(false);
   let currentPassword = $state('');
   let newPassword = $state('');
-  let accountFeedback = $state<{ type: 'error' | 'success'; message: string } | null>(null);
 
   // Keys that should be masked (actual secrets). Non-secret config values show plain.
   const SENSITIVE_KEYS = new Set([
@@ -88,11 +93,22 @@
     'github_token', 'exa_api_key', 'tensorlake_api_key', 'modal_token_id', 'modal_token_secret', 'dd_api_key', 'dd_app_key', 'temper_api_key',
   ]);
 
-  function showFeedback(type: 'error' | 'success', message: string) {
-    feedback = { type, message };
+  function showFeedback(slot: string, type: 'error' | 'success', message: string) {
+    feedback[slot] = { type, message };
+    feedback = { ...feedback };
+    if (feedbackTimers[slot]) clearTimeout(feedbackTimers[slot]);
     if (type === 'success') {
-      setTimeout(() => { feedback = null; }, 3000);
+      feedbackTimers[slot] = setTimeout(() => {
+        feedback[slot] = null;
+        feedback = { ...feedback };
+      }, 4000);
     }
+  }
+
+  function clearFeedback(slot: string) {
+    if (feedbackTimers[slot]) clearTimeout(feedbackTimers[slot]);
+    feedback[slot] = null;
+    feedback = { ...feedback };
   }
 
   async function copyDiscordInteractionUrl() {
@@ -100,9 +116,9 @@
     if (!interactionUrl) return;
     try {
       await navigator.clipboard.writeText(interactionUrl);
-      showFeedback('success', 'Copied Discord Interaction URL. Paste it into Discord Developer Portal -> General Information -> Interactions Endpoint URL.');
+      showFeedback('discord', 'success', 'Copied Discord Interaction URL. Paste it into Discord Developer Portal -> General Information -> Interactions Endpoint URL.');
     } catch {
-      showFeedback('error', 'Failed to copy the Discord Interaction URL');
+      showFeedback('discord', 'error', 'Failed to copy the Discord Interaction URL');
     }
   }
 
@@ -171,7 +187,7 @@
 
       vars = rows;
     } catch (err) {
-      showFeedback('error', err instanceof Error ? err.message : 'Failed to load');
+      showFeedback('page', 'error', err instanceof Error ? err.message : 'Failed to load');
     } finally {
       loading = false;
     }
@@ -201,12 +217,12 @@
       row.draft = '';
       status = await fetchSetupStatus();
       if (row.key.startsWith('discord_') && status?.discord_connected) {
-        showFeedback('success', `${row.key} saved and Discord reconnected`);
+        showFeedback(row.key, 'success', `${row.key} saved and Discord reconnected`);
       } else {
-        showFeedback('success', `${row.key} saved`);
+        showFeedback(row.key, 'success', `${row.key} saved`);
       }
     } catch (err) {
-      showFeedback('error', `Failed to save ${row.key}: ${err instanceof Error ? err.message : 'unknown'}`);
+      showFeedback(row.key, 'error', `Failed to save ${row.key}: ${err instanceof Error ? err.message : 'unknown'}`);
     } finally {
       row.saving = false;
       vars = [...vars];
@@ -231,7 +247,7 @@
     } catch (err) {
       row.saving = false;
       vars = [...vars];
-      showFeedback('error', `Failed to delete ${row.key}`);
+      showFeedback(row.key, 'error', `Failed to delete ${row.key}`);
     }
   }
 
@@ -249,58 +265,133 @@
       newKey = '';
       newValue = '';
       addingVar = false;
-      showFeedback('success', `${k} added`);
+      showFeedback('add', 'success', `${k} added`);
     } catch (err) {
-      showFeedback('error', `Failed to add ${k}: ${err instanceof Error ? err.message : 'unknown'}`);
+      showFeedback('add', 'error', `Failed to add ${k}: ${err instanceof Error ? err.message : 'unknown'}`);
     }
   }
 
-  // Group vars by category, LLM always first
-  let groupedVars = $derived.by(() => {
+  // ── Provider registry ──
+  // Maps a secret key to the provider card it belongs to. Rules are ordered
+  // most-specific-first (e.g. `openai_codex*` and `openai_compatible*` before the
+  // bare `openai_api_key`). `category` lets us re-home keys that arrive as
+  // "custom" (e.g. dd_* observability keys that aren't in the backend schema)
+  // into the right section. Returns null for keys with no known provider — those
+  // collect into an "Other" card inside their own category so nothing is lost.
+  interface ProviderInfo { id: string; name: string; category: string; }
+  function resolveProvider(key: string): ProviderInfo | null {
+    const llm = (id: string, name: string): ProviderInfo => ({ id, name, category: 'llm' });
+    if (key.startsWith('openai_codex')) return llm('codex', 'OpenAI Codex');
+    if (key.startsWith('openai_compatible')) return llm('openai_compatible', 'OpenAI-Compatible');
+    if (key === 'openai_api_key') return llm('openai', 'OpenAI');
+    if (key.startsWith('anthropic_')) return llm('anthropic', 'Anthropic');
+    if (key.startsWith('openrouter_')) return llm('openrouter', 'OpenRouter');
+    if (key.startsWith('huggingface_') || key === 'hf_token') return llm('huggingface', 'Hugging Face');
+    if (key.startsWith('fireworks_')) return llm('fireworks', 'Fireworks');
+    if (key.startsWith('sakana')) return llm('sakana', 'Sakana');
+    if (key.startsWith('local_openai')) return llm('local_openai', 'Local (Ollama)');
+    if (key === 'llm_provider' || key === 'llm_model') return llm('llm_active', 'Active Model');
+    if (key.startsWith('discord_')) return { id: 'discord', name: 'Discord', category: 'messaging' };
+    if (key.startsWith('slack_')) return { id: 'slack', name: 'Slack', category: 'messaging' };
+    if (key.startsWith('exa_')) return { id: 'exa', name: 'Exa', category: 'web_search' };
+    if (key.startsWith('modal_')) return { id: 'modal', name: 'Modal', category: 'sandbox' };
+    if (key.startsWith('tensorlake_')) return { id: 'tensorlake', name: 'TensorLake', category: 'sandbox' };
+    if (key === 'sandbox_provider') return { id: 'sandbox_active', name: 'Active Provider', category: 'sandbox' };
+    if (key.startsWith('github_')) return { id: 'github', name: 'GitHub', category: 'integrations' };
+    if (key.startsWith('dd_')) return { id: 'datadog', name: 'Datadog', category: 'observability' };
+    return null;
+  }
+
+  // Ordering of provider cards within a category. Indices only need to be unique
+  // per category. Unknown providers (incl. the "Other" fallback) sort last.
+  const PROVIDER_ORDER: Record<string, number> = {
+    anthropic: 0, openai: 1, codex: 2, openrouter: 3, huggingface: 4, fireworks: 5,
+    sakana: 6, openai_compatible: 7, local_openai: 8, llm_active: 9,
+    discord: 0, slack: 1,
+    exa: 0,
+    modal: 0, tensorlake: 1, sandbox_active: 2,
+    github: 0,
+    datadog: 0,
+  };
+
+  interface ProviderCardData {
+    id: string;
+    name: string;
+    category: string;
+    special: '' | 'discord' | 'slack' | 'codex';
+    rows: VarRow[];
+  }
+
+  // A provider card's status dot: connection-aware for the transports/OAuth
+  // providers, otherwise "on" when any of its keys is set.
+  function cardOn(card: ProviderCardData): boolean {
+    if (card.special === 'discord') return !!status?.discord_connected;
+    if (card.special === 'slack') return !!status?.slack_connected;
+    if (card.special === 'codex') return !!codexStatus?.configured;
+    return card.rows.some(r => r.filled);
+  }
+
+  // Group every variable into per-provider cards, then group cards by category.
+  let groupedProviders = $derived.by(() => {
     const catOrder = ['llm', 'web_search', 'sandbox', 'messaging', 'integrations', 'observability', 'custom'];
-    const catMap = new Map<string, VarRow[]>();
+    const cats = new Map<string, Map<string, ProviderCardData>>();
     for (const v of vars) {
-      const cat = v.category || 'custom';
-      if (!catMap.has(cat)) catMap.set(cat, []);
-      catMap.get(cat)!.push(v);
+      const info = resolveProvider(v.key);
+      const category = info?.category ?? v.category ?? 'custom';
+      const id = info?.id ?? 'other';
+      const name = info?.name ?? 'Other';
+      if (!cats.has(category)) cats.set(category, new Map());
+      const providers = cats.get(category)!;
+      if (!providers.has(id)) {
+        const special = id === 'discord' ? 'discord' : id === 'slack' ? 'slack' : id === 'codex' ? 'codex' : '';
+        providers.set(id, { id, name, category, special, rows: [] });
+      }
+      providers.get(id)!.rows.push(v);
     }
-    const groups: Array<{ category: string; rows: VarRow[] }> = [];
-    for (const cat of catOrder) {
-      if (catMap.has(cat)) groups.push({ category: cat, rows: catMap.get(cat)! });
-    }
-    for (const [cat, rows] of catMap) {
-      if (!catOrder.includes(cat)) groups.push({ category: cat, rows });
-    }
-    return groups;
+    const orderIdx = (id: string) => PROVIDER_ORDER[id] ?? 99;
+    const result: Array<{ category: string; cards: ProviderCardData[] }> = [];
+    const emit = (category: string) => {
+      const providers = cats.get(category);
+      if (!providers) return;
+      const cards = [...providers.values()].sort(
+        (a, b) => orderIdx(a.id) - orderIdx(b.id) || a.name.localeCompare(b.name),
+      );
+      result.push({ category, cards });
+    };
+    for (const c of catOrder) emit(c);
+    for (const c of cats.keys()) if (!catOrder.includes(c)) emit(c);
+    return result;
   });
 
   // Discord connect
   async function handleConnectDiscord() {
     connectingDiscord = true;
-    feedback = null;
+    clearFeedback('discord');
     try {
       const botToken = vars.find(v => v.key === 'discord_bot_token')?.value ?? '';
       const publicKey = vars.find(v => v.key === 'discord_public_key')?.value ?? '';
       const guildId = vars.find(v => v.key === 'discord_guild_id')?.value ?? '';
       const feedChannel = vars.find(v => v.key === 'discord_feed_channel_id')?.value ?? '';
       const forumChannel = vars.find(v => v.key === 'discord_forum_channel_id')?.value ?? '';
-      if (!botToken) { showFeedback('error', 'Set discord_bot_token first'); return; }
+      const interactionDelivery = (vars.find(v => v.key === 'discord_interaction_delivery')?.value || status?.discord_interaction_delivery || 'gateway') as 'gateway' | 'webhook';
+      if (!botToken) { showFeedback('discord', 'error', 'Set discord_bot_token first'); return; }
       const result = await connectDiscord({
         bot_token: botToken,
         public_key: publicKey || undefined,
         guild_id: guildId || undefined,
         feed_channel_id: feedChannel || undefined,
         forum_channel_id: forumChannel || undefined,
+        interaction_delivery: interactionDelivery,
       });
       status = await fetchSetupStatus();
       const interactionUrl = result.discord_interaction_url ?? status?.discord_interaction_url;
       if (interactionUrl) {
-        showFeedback('success', 'Discord connected. Copy the Interaction URL below into Discord Developer Portal -> General Information -> Interactions Endpoint URL, then save.');
+        showFeedback('discord', 'success', 'Discord connected in Interaction URL mode. Copy the URL below into Discord Developer Portal -> General Information -> Interactions Endpoint URL, then save.');
       } else {
-        showFeedback('success', 'Discord connected');
+        showFeedback('discord', 'success', 'Discord connected in Gateway mode. Clear the Interaction URL in Discord Developer Portal so interactions arrive over the Gateway.');
       }
     } catch (err) {
-      showFeedback('error', err instanceof Error ? err.message : 'Discord connection failed');
+      showFeedback('discord', 'error', err instanceof Error ? err.message : 'Discord connection failed');
     } finally { connectingDiscord = false; }
   }
 
@@ -309,28 +400,28 @@
     try {
       await disconnectDiscord();
       status = await fetchSetupStatus();
-      showFeedback('success', 'Discord disconnected');
+      showFeedback('discord', 'success', 'Discord disconnected');
     } catch (err) {
-      showFeedback('error', err instanceof Error ? err.message : 'Failed');
+      showFeedback('discord', 'error', err instanceof Error ? err.message : 'Failed');
     } finally { connectingDiscord = false; }
   }
 
   async function handleConnectSlack() {
     connectingSlack = true;
-    feedback = null;
+    clearFeedback('slack');
     try {
       const appToken = vars.find(v => v.key === 'slack_app_token')?.value ?? '';
       const botToken = vars.find(v => v.key === 'slack_bot_token')?.value ?? '';
       const signing = vars.find(v => v.key === 'slack_signing_secret')?.value ?? '';
-      if (!appToken || !botToken) { showFeedback('error', 'Set slack_app_token and slack_bot_token first'); return; }
+      if (!appToken || !botToken) { showFeedback('slack', 'error', 'Set slack_app_token and slack_bot_token first'); return; }
       await connectSlack({
         app_token: appToken, bot_token: botToken,
         signing_secret: signing || undefined,
       });
       status = await fetchSetupStatus();
-      showFeedback('success', 'Slack connected');
+      showFeedback('slack', 'success', 'Slack connected');
     } catch (err) {
-      showFeedback('error', err instanceof Error ? err.message : 'Slack connection failed');
+      showFeedback('slack', 'error', err instanceof Error ? err.message : 'Slack connection failed');
     } finally { connectingSlack = false; }
   }
 
@@ -339,15 +430,15 @@
     try {
       await disconnectSlack();
       status = await fetchSetupStatus();
-      showFeedback('success', 'Slack disconnected');
+      showFeedback('slack', 'success', 'Slack disconnected');
     } catch (err) {
-      showFeedback('error', err instanceof Error ? err.message : 'Failed');
+      showFeedback('slack', 'error', err instanceof Error ? err.message : 'Failed');
     } finally { connectingSlack = false; }
   }
 
   async function handleStartCodexLogin() {
     codexStarting = true;
-    feedback = null;
+    clearFeedback('codex');
     try {
       codexStatus = await startOpenAICodexDeviceLogin();
       codexExpired = false;
@@ -356,10 +447,10 @@
         // do, and a transient duplicate above it makes the layout jump.
         startCodexBackgroundPoll();
       } else {
-        showFeedback('success', 'OpenAI Codex device login started');
+        showFeedback('codex', 'success', 'OpenAI Codex device login started');
       }
     } catch (err) {
-      showFeedback('error', err instanceof Error ? err.message : 'OpenAI Codex login failed');
+      showFeedback('codex', 'error', err instanceof Error ? err.message : 'OpenAI Codex login failed');
     } finally { codexStarting = false; }
   }
 
@@ -389,7 +480,7 @@
     if (Date.now() >= codexPollDeadlineMs) {
       stopCodexBackgroundPoll();
       codexExpired = true;
-      showFeedback('error', 'OpenAI Codex device code expired. Start sign-in again.');
+      showFeedback('codex', 'error', 'OpenAI Codex device code expired. Start sign-in again.');
       return;
     }
     await runCodexPoll(false);
@@ -399,26 +490,26 @@
   async function runCodexPoll(manual: boolean): Promise<void> {
     if (codexPolling) return;
     codexPolling = true;
-    if (manual) feedback = null;
+    if (manual) clearFeedback('codex');
     try {
       const next = await pollOpenAICodexDeviceLogin();
       codexStatus = next;
       if (next.configured) {
         stopCodexBackgroundPoll();
         status = await fetchSetupStatus();
-        showFeedback('success', 'OpenAI Codex connected');
+        showFeedback('codex', 'success', 'OpenAI Codex connected');
         await load();
         return;
       }
       if (next.status === 'Failed') {
         stopCodexBackgroundPoll();
-        showFeedback('error', next.last_error || 'OpenAI Codex sign-in failed');
+        showFeedback('codex', 'error', next.last_error || 'OpenAI Codex sign-in failed');
       }
     } catch (err) {
       // Surface manual errors; swallow transient background errors and keep
       // retrying until the deadline.
       if (manual) {
-        showFeedback('error', err instanceof Error ? err.message : 'OpenAI Codex polling failed');
+        showFeedback('codex', 'error', err instanceof Error ? err.message : 'OpenAI Codex polling failed');
       }
     } finally {
       codexPolling = false;
@@ -432,9 +523,9 @@
       codexStatus = await disconnectOpenAICodexAuth();
       status = await fetchSetupStatus();
       await load();
-      showFeedback('success', 'OpenAI Codex disconnected');
+      showFeedback('codex', 'success', 'OpenAI Codex disconnected');
     } catch (err) {
-      showFeedback('error', err instanceof Error ? err.message : 'OpenAI Codex disconnect failed');
+      showFeedback('codex', 'error', err instanceof Error ? err.message : 'OpenAI Codex disconnect failed');
     } finally { connectingCodex = false; }
   }
 
@@ -457,15 +548,14 @@
   });
 
   async function updatePassword() {
-    accountFeedback = null;
+    clearFeedback('account');
     try {
       await changePassword(currentPassword, newPassword);
       currentPassword = '';
       newPassword = '';
-      accountFeedback = { type: 'success', message: 'Password updated' };
-      setTimeout(() => { accountFeedback = null; }, 3000);
+      showFeedback('account', 'success', 'Password updated');
     } catch (err) {
-      accountFeedback = { type: 'error', message: err instanceof Error ? err.message : 'Failed' };
+      showFeedback('account', 'error', err instanceof Error ? err.message : 'Failed');
     }
   }
 
@@ -484,6 +574,12 @@
     observability: 'Observability',
     custom: 'Custom',
   };
+
+  // Anchor id for deep-linking a provider card. Provider ids are unique across
+  // categories except the "Other" fallback, which gets category-qualified.
+  function cardAnchor(card: ProviderCardData): string {
+    return card.id === 'other' ? `${card.category}-other` : card.id;
+  }
 </script>
 
 <svelte:head>
@@ -493,132 +589,198 @@
 <div class="page">
   <h1 class="page-title">SETTINGS</h1>
 
+  <!-- Inline feedback slot: renders a message adjacent to the control that
+       produced it, keyed by `slot`. -->
+  {#snippet fbSlot(slot: string)}
+    {@const fb = feedback[slot]}
+    {#if fb}
+      <div class="slot-fb" class:slot-fb--err={fb.type === 'error'}>{fb.message}</div>
+    {/if}
+  {/snippet}
+
+  <!-- A single editable variable row + its own inline feedback slot. -->
+  {#snippet varRow(row: VarRow)}
+    <div class="var-row">
+      <div class="var-main">
+        <span class="var-dot" class:var-dot--on={row.filled}></span>
+        <span class="var-key">{row.key}</span>
+        <span class="var-val">
+          {#if row.filled}
+            {row.sensitive ? mask(row.value) : row.value}
+          {:else}
+            <span class="var-unset">--</span>
+          {/if}
+        </span>
+        <div class="var-actions">
+          {#if row.editing}
+            <button class="act" onclick={() => cancelEdit(row)} disabled={row.saving}>Cancel</button>
+          {:else}
+            <button class="act" onclick={() => startEdit(row)}>{row.filled ? 'Edit' : 'Set'}</button>
+            {#if row.filled}
+              <button class="act act-danger" onclick={() => removeVar(row)} disabled={row.saving}>Del</button>
+            {/if}
+          {/if}
+        </div>
+      </div>
+      {#if row.description && !row.editing}
+        <div class="var-desc">{row.description}</div>
+      {/if}
+      {#if row.editing}
+        <form class="var-edit" onsubmit={(e) => { e.preventDefault(); saveVar(row); }}>
+          <input
+            class="var-input"
+            type={row.sensitive ? 'password' : 'text'}
+            bind:value={row.draft}
+            placeholder={row.sensitive ? 'Enter value' : row.value || 'Enter value'}
+            disabled={row.saving}
+          />
+          <button class="btn-sm" type="submit" disabled={!row.draft.trim() || row.saving}>
+            {row.saving ? '...' : 'Save'}
+          </button>
+        </form>
+      {/if}
+      {@render fbSlot(row.key)}
+    </div>
+  {/snippet}
+
+  <!-- Generic provider card: status dot, name, its variable rows and an inline
+       feedback slot. Providers that need extra controls (Discord/Slack Connect,
+       Codex device-code sign-in) are rendered bespoke below instead. -->
+  {#snippet providerCard(card: ProviderCardData)}
+    <div class="provider-card" id={cardAnchor(card)}>
+      <div class="provider-head">
+        <span class="cat-dot" class:cat-dot--on={cardOn(card)}></span>
+        <span class="provider-name"><a class="anchor" href="#{cardAnchor(card)}">{card.name}</a></span>
+      </div>
+      {@render fbSlot(card.id)}
+      {#each card.rows as row (row.key)}
+        {@render varRow(row)}
+      {/each}
+    </div>
+  {/snippet}
+
   {#if loading}
     <p class="dim">Loading...</p>
   {:else}
-    {#if feedback}
-      <div class="toast" class:toast-err={feedback.type === 'error'}>{feedback.message}</div>
-    {/if}
+    {@render fbSlot('page')}
 
-    <!-- Variable list grouped by category -->
+    <!-- Provider cards grouped by category; every category and card is a
+         deep-linkable anchor target. -->
     <div class="var-list">
-      {#each groupedVars as group}
-        <div class="cat-header">
-          <span class="cat-label">{CAT_LABELS[group.category] ?? group.category}</span>
-          <!-- Inline connect/disconnect for messaging -->
-          {#if group.category === 'messaging'}
-            <div class="cat-actions">
-              {#if status?.discord_connected}
-                <button class="cat-act" onclick={handleDisconnectDiscord} disabled={connectingDiscord}>
-                  <span class="cat-dot cat-dot--on"></span> Discord <span class="cat-act-label">Disconnect</span>
-                </button>
-              {:else}
-                <button class="cat-act" onclick={handleConnectDiscord} disabled={connectingDiscord}>
-                  <span class="cat-dot"></span> Discord <span class="cat-act-label">Connect</span>
-                </button>
-              {/if}
-              {#if status?.slack_connected}
-                <button class="cat-act" onclick={handleDisconnectSlack} disabled={connectingSlack}>
-                  <span class="cat-dot cat-dot--on"></span> Slack <span class="cat-act-label">Disconnect</span>
-                </button>
-              {:else}
-                <button class="cat-act" onclick={handleConnectSlack} disabled={connectingSlack}>
-                  <span class="cat-dot"></span> Slack <span class="cat-act-label">Connect</span>
-                </button>
-              {/if}
-            </div>
-          {/if}
-          {#if group.category === 'llm'}
-            <div class="cat-actions">
-              {#if codexStatus?.configured}
-                <button class="cat-act" onclick={handleDisconnectCodex} disabled={connectingCodex}>
-                  <span class="cat-dot cat-dot--on"></span> Codex <span class="cat-act-label">Disconnect</span>
-                </button>
-              {:else}
-                <button class="cat-act" onclick={handleStartCodexLogin} disabled={codexStarting || codexAwaitingCode}>
-                  {#if codexStarting}
-                    <span class="spinner spinner--sm"></span> Codex <span class="cat-act-label">Requesting code…</span>
-                  {:else if codexAwaitingCode}
-                    <span class="cat-dot"></span> Codex <span class="cat-act-label">Awaiting code…</span>
+      {#each groupedProviders as group}
+        <section class="cat-group" id={group.category}>
+        <h2 class="cat-title"><a class="anchor" href="#{group.category}">{CAT_LABELS[group.category] ?? group.category}</a></h2>
+
+        {#each group.cards as card (card.category + ':' + card.id)}
+          {#if card.special === 'discord'}
+            <!-- Discord: Connect/Disconnect, fields, interaction URL. -->
+            <div class="provider-card" id={cardAnchor(card)}>
+              <div class="provider-head">
+                <span class="cat-dot" class:cat-dot--on={status?.discord_connected}></span>
+                <span class="provider-name"><a class="anchor" href="#{cardAnchor(card)}">Discord</a></span>
+                <div class="provider-actions">
+                  {#if status?.discord_connected}
+                    <button class="cat-act" onclick={handleDisconnectDiscord} disabled={connectingDiscord}>Disconnect</button>
                   {:else}
-                    <span class="cat-dot"></span> Codex <span class="cat-act-label">Sign in</span>
+                    <button class="cat-act" onclick={handleConnectDiscord} disabled={connectingDiscord}>Connect</button>
                   {/if}
-                </button>
+                </div>
+              </div>
+              {@render fbSlot('discord')}
+              <div class="provider-hint">Saving Discord credentials applies them immediately. Use Connect only to retry manually. Enable <strong>Message Content Intent</strong> in Discord Developer Portal &rarr; Bot — the Gateway requires it.</div>
+              {#each card.rows as row (row.key)}
+                {@render varRow(row)}
+              {/each}
+              {#if status?.discord_interaction_delivery}
+                <div class="cat-hint">
+                  <div class="interaction-copy-row">
+                    <span class="interaction-copy-label">Discord Interaction Delivery</span>
+                  </div>
+                  <code class="interaction-url">{status.discord_interaction_delivery}</code>
+                  <div>{status.discord_interaction_delivery === 'gateway' ? 'Clear the Interactions Endpoint URL in Discord Developer Portal. Discord will deliver slash commands and buttons over the Gateway.' : 'Discord will POST interactions to the public Interactions Endpoint URL.'}</div>
+                </div>
+              {/if}
+              {#if status?.discord_interaction_url}
+                <div class="cat-hint">
+                  <div class="interaction-copy-row">
+                    <span class="interaction-copy-label">Discord Interaction URL</span>
+                    <button class="act" onclick={copyDiscordInteractionUrl}>Copy</button>
+                  </div>
+                  <code class="interaction-url">{status.discord_interaction_url}</code>
+                  <div>Paste this into Discord Developer Portal -> General Information -> Interactions Endpoint URL, then click Save Changes.</div>
+                </div>
               {/if}
             </div>
-          {/if}
-        </div>
-        {#if group.category === 'llm' && codexAwaitingCode}
-          <div class="cat-hint">
-            <div class="interaction-copy-row">
-              <span class="interaction-copy-label">OpenAI Codex Device Code</span>
-              <button class="act" onclick={() => runCodexPoll(true)} disabled={codexPolling}>
-                {codexPolling ? 'Checking…' : 'Check'}
-              </button>
-            </div>
-            <code class="interaction-url">{codexStatus?.user_code}</code>
-            <div><a href={codexStatus?.verification_url} target="_blank" rel="noreferrer">{codexStatus?.verification_url}</a></div>
-            <div class="codex-poll-status">
-              <span class="spinner spinner--sm"></span>
-              Open the link, enter the code, and authorize — checking automatically every 5s.
-            </div>
-          </div>
-        {/if}
-        {#if group.category === 'messaging'}
-          <div class="cat-hint">Saving Discord credentials applies them immediately. Use Connect only to retry manually.</div>
-        {/if}
-        {#if group.category === 'messaging' && status?.discord_interaction_url}
-          <div class="cat-hint">
-            <div class="interaction-copy-row">
-              <span class="interaction-copy-label">Discord Interaction URL</span>
-              <button class="act" onclick={copyDiscordInteractionUrl}>Copy</button>
-            </div>
-            <code class="interaction-url">{status.discord_interaction_url}</code>
-            <div>Paste this into Discord Developer Portal -> General Information -> Interactions Endpoint URL, then click Save Changes.</div>
-          </div>
-        {/if}
-        {#each group.rows as row (row.key)}
-          <div class="var-row">
-            <div class="var-main">
-              <span class="var-dot" class:var-dot--on={row.filled}></span>
-              <span class="var-key">{row.key}</span>
-              <span class="var-val">
-                {#if row.filled}
-                  {row.sensitive ? mask(row.value) : row.value}
-                {:else}
-                  <span class="var-unset">--</span>
-                {/if}
-              </span>
-              <div class="var-actions">
-                {#if row.editing}
-                  <button class="act" onclick={() => cancelEdit(row)} disabled={row.saving}>Cancel</button>
-                {:else}
-                  <button class="act" onclick={() => startEdit(row)}>{row.filled ? 'Edit' : 'Set'}</button>
-                  {#if row.filled}
-                    <button class="act act-danger" onclick={() => removeVar(row)} disabled={row.saving}>Del</button>
+
+          {:else if card.special === 'slack'}
+            <!-- Slack: Connect/Disconnect and fields. -->
+            <div class="provider-card" id={cardAnchor(card)}>
+              <div class="provider-head">
+                <span class="cat-dot" class:cat-dot--on={status?.slack_connected}></span>
+                <span class="provider-name"><a class="anchor" href="#{cardAnchor(card)}">Slack</a></span>
+                <div class="provider-actions">
+                  {#if status?.slack_connected}
+                    <button class="cat-act" onclick={handleDisconnectSlack} disabled={connectingSlack}>Disconnect</button>
+                  {:else}
+                    <button class="cat-act" onclick={handleConnectSlack} disabled={connectingSlack}>Connect</button>
                   {/if}
-                {/if}
+                </div>
               </div>
+              {@render fbSlot('slack')}
+              {#each card.rows as row (row.key)}
+                {@render varRow(row)}
+              {/each}
             </div>
-            {#if row.description && !row.editing}
-              <div class="var-desc">{row.description}</div>
-            {/if}
-            {#if row.editing}
-              <form class="var-edit" onsubmit={(e) => { e.preventDefault(); saveVar(row); }}>
-                <input
-                  class="var-input"
-                  type={row.sensitive ? 'password' : 'text'}
-                  bind:value={row.draft}
-                  placeholder={row.sensitive ? 'Enter value' : row.value || 'Enter value'}
-                  disabled={row.saving}
-                />
-                <button class="btn-sm" type="submit" disabled={!row.draft.trim() || row.saving}>
-                  {row.saving ? '...' : 'Save'}
-                </button>
-              </form>
-            {/if}
-          </div>
+
+          {:else if card.special === 'codex'}
+            <!-- OpenAI Codex: device-code sign-in plus the managed token rows. -->
+            <div class="provider-card" id={cardAnchor(card)}>
+              <div class="provider-head">
+                <span class="cat-dot" class:cat-dot--on={codexStatus?.configured}></span>
+                <span class="provider-name"><a class="anchor" href="#{cardAnchor(card)}">OpenAI Codex</a></span>
+                <div class="provider-actions">
+                  {#if codexStatus?.configured}
+                    <button class="cat-act" onclick={handleDisconnectCodex} disabled={connectingCodex}>Disconnect</button>
+                  {:else}
+                    <button class="cat-act" onclick={handleStartCodexLogin} disabled={codexStarting || codexAwaitingCode}>
+                      {#if codexStarting}
+                        <span class="spinner spinner--sm"></span> Requesting code…
+                      {:else if codexAwaitingCode}
+                        Awaiting code…
+                      {:else}
+                        Sign in
+                      {/if}
+                    </button>
+                  {/if}
+                </div>
+              </div>
+              {@render fbSlot('codex')}
+              {#if codexAwaitingCode}
+                <div class="cat-hint">
+                  <div class="interaction-copy-row">
+                    <span class="interaction-copy-label">OpenAI Codex Device Code</span>
+                    <button class="act" onclick={() => runCodexPoll(true)} disabled={codexPolling}>
+                      {codexPolling ? 'Checking…' : 'Check'}
+                    </button>
+                  </div>
+                  <code class="interaction-url">{codexStatus?.user_code}</code>
+                  <div><a href={codexStatus?.verification_url} target="_blank" rel="noreferrer">{codexStatus?.verification_url}</a></div>
+                  <div class="codex-poll-status">
+                    <span class="spinner spinner--sm"></span>
+                    Open the link, enter the code, and authorize — checking automatically every 5s.
+                  </div>
+                </div>
+              {/if}
+              {#each card.rows as row (row.key)}
+                {@render varRow(row)}
+              {/each}
+            </div>
+
+          {:else}
+            {@render providerCard(card)}
+          {/if}
         {/each}
+        </section>
       {/each}
 
       <!-- Add variable -->
@@ -632,14 +794,12 @@
       {:else}
         <button class="add-btn" onclick={() => addingVar = true}>+ Add variable</button>
       {/if}
+      {@render fbSlot('add')}
     </div>
 
     <!-- Account -->
-    <div class="section">
-      <span class="cat-label">Account</span>
-      {#if accountFeedback}
-        <span class="inline-fb" class:fb-err={accountFeedback.type === 'error'} class:fb-ok={accountFeedback.type === 'success'}>{accountFeedback.message}</span>
-      {/if}
+    <section class="cat-group section" id="account">
+      <h2 class="cat-title"><a class="anchor" href="#account">Account</a></h2>
       <div class="acct-row">
         <span class="var-key">temper_api_key</span>
         <span class="var-val">{showApiKey ? apiKey : mask(apiKey)}</span>
@@ -650,7 +810,8 @@
         <input class="var-input" type="password" bind:value={newPassword} placeholder="New password" />
         <button class="btn-sm" type="submit" disabled={!currentPassword || !newPassword}>Change password</button>
       </form>
-    </div>
+      {@render fbSlot('account')}
+    </section>
   {/if}
 </div>
 
@@ -671,19 +832,24 @@
     color: var(--text-3);
   }
 
-  .toast {
+  /* ── Inline feedback slot ── */
+  .slot-fb {
     font-family: var(--font-mono);
     font-size: var(--text-xs);
+    line-height: 1.4;
     color: var(--accent);
-    padding: var(--sp-2) var(--sp-3);
-    border: 1px solid rgba(52,211,153,0.15);
+    padding: var(--sp-1) var(--sp-2);
+    border-left: 2px solid var(--accent);
+    background: rgba(52,211,153,0.06);
     border-radius: var(--radius);
-    margin-bottom: var(--sp-4);
+    margin: var(--sp-1) 0;
+    word-break: break-word;
   }
 
-  .toast-err {
+  .slot-fb--err {
     color: var(--status-error);
-    border-color: rgba(248,113,113,0.15);
+    border-left-color: var(--status-error);
+    background: rgba(248,113,113,0.06);
   }
 
   /* ── Var list ── */
@@ -691,35 +857,85 @@
     display: flex;
     flex-direction: column;
     margin-bottom: var(--sp-6);
-    border-bottom: 1px solid var(--border);
-    padding-bottom: var(--sp-2);
   }
 
-  /* ── Category header ── */
-  .cat-header {
+  /* ── Category group box ── */
+  .cat-group {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--sp-3);
+    margin-bottom: var(--sp-4);
+    scroll-margin-top: var(--sp-6);
+  }
+
+  .cat-title {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    font-weight: 600;
+    color: var(--text-2);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin: 0 0 var(--sp-2) 0;
+  }
+
+  /* Category and provider titles double as deep links; a trailing # appears
+     on hover to signal the anchor. */
+  .anchor {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .anchor:hover::after {
+    content: ' #';
+    color: var(--text-3);
+  }
+
+  .cat-group:target,
+  .provider-card:target {
+    border-color: var(--text-2);
+  }
+
+  /* ── Provider subsection card ── */
+  .provider-card {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--sp-2) var(--sp-3);
+    margin: 0 0 var(--sp-2) 0;
+    scroll-margin-top: var(--sp-6);
+  }
+
+  .provider-card:last-child {
+    margin-bottom: 0;
+  }
+
+  .provider-head {
     display: flex;
     align-items: center;
-    gap: var(--sp-3);
-    padding: var(--sp-4) 0 var(--sp-1) 0;
+    gap: var(--sp-2);
+    min-height: 24px;
   }
 
-  .cat-header:first-child {
-    padding-top: 0;
+  .provider-name {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--text-1);
+    letter-spacing: 0.04em;
   }
 
-  .cat-label {
+  .provider-actions {
+    display: flex;
+    gap: var(--sp-2);
+    margin-left: auto;
+  }
+
+  .provider-hint {
     font-family: var(--font-mono);
     font-size: var(--text-xs);
     color: var(--text-3);
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    flex-shrink: 0;
-  }
-
-  .cat-actions {
-    display: flex;
-    gap: var(--sp-3);
-    margin-left: auto;
+    opacity: 0.8;
+    padding: var(--sp-1) 0;
   }
 
   .cat-act {
@@ -730,19 +946,14 @@
     font-size: var(--text-xs);
     color: var(--text-2);
     background: none;
-    border: none;
+    border: 1px solid var(--border);
     cursor: pointer;
-    padding: 2px var(--sp-1);
+    padding: 2px var(--sp-2);
     border-radius: var(--radius);
   }
 
-  .cat-act:hover { color: var(--text-1); }
+  .cat-act:hover { color: var(--text-1); border-color: var(--text-2); }
   .cat-act:disabled { opacity: 0.3; cursor: not-allowed; }
-
-  .cat-act-label {
-    color: var(--text-3);
-    margin-left: 2px;
-  }
 
   .cat-dot {
     width: 5px; height: 5px;
@@ -965,14 +1176,6 @@
     padding-bottom: var(--sp-4);
   }
 
-  .inline-fb {
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-  }
-
-  .fb-err { color: var(--status-error); }
-  .fb-ok { color: var(--accent); }
-
   .acct-row {
     display: flex;
     align-items: center;
@@ -994,8 +1197,7 @@
     .var-main { flex-wrap: wrap; }
     .var-val { max-width: none; text-align: left; margin-left: 0; width: 100%; padding-left: calc(6px + var(--sp-2)); }
     .var-actions { width: 100%; padding-left: calc(6px + var(--sp-2)); }
-    .cat-actions { flex-wrap: wrap; gap: var(--sp-2); }
-    .cat-header { flex-wrap: wrap; }
+    .provider-head { flex-wrap: wrap; }
     .pw-form { flex-direction: column; align-items: stretch; }
     .var-edit { padding-left: 0; flex-direction: column; }
     .add-form { flex-wrap: wrap; }

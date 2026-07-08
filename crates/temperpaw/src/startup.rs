@@ -539,9 +539,11 @@ async fn bootstrap_configured_genesis_apps(
 }
 
 #[cfg(test)]
-fn startup_discord_connect_result(result: anyhow::Result<String>) -> Option<String> {
+fn startup_discord_connect_result(
+    result: anyhow::Result<crate::transport_manager::DiscordConnectResult>,
+) -> Option<String> {
     match result {
-        Ok(interaction_url) => Some(interaction_url),
+        Ok(result) => result.interaction_url,
         Err(error) => {
             tracing::error!(
                 error = %error,
@@ -1429,6 +1431,13 @@ pub async fn run(mut config: Config, force_soul_setup: bool) -> Result<()> {
             vault,
             &storage,
             &tenant,
+            "discord_interaction_delivery",
+            config.discord_interaction_delivery
+        );
+        seed_secret!(
+            vault,
+            &storage,
+            &tenant,
             "slack_bot_token",
             config.slack_bot_token
         );
@@ -2206,9 +2215,28 @@ pub async fn run(mut config: Config, force_soul_setup: bool) -> Result<()> {
         }
         if let Some(label) = startup_discord_summary_label(has_discord, &transport_status.discord) {
             println!("  {label}");
-            if let Some(interaction_url) = transport_manager.discord_interaction_public_url().await
-            {
-                println!("  Discord interactions: {interaction_url}");
+            let interaction_delivery = vault
+                .and_then(|v| v.get_secret(&tenant, "discord_interaction_delivery"))
+                .as_deref()
+                .and_then(|value| {
+                    crate::transport_manager::DiscordInteractionDelivery::try_from_config_value(
+                        Some(value),
+                    )
+                    .ok()
+                })
+                .unwrap_or_default();
+            println!(
+                "  Discord interaction delivery: {}",
+                interaction_delivery.as_str()
+            );
+            if interaction_delivery.requires_public_url() {
+                if let Some(interaction_url) =
+                    transport_manager.discord_interaction_public_url().await
+                {
+                    println!("  Discord interactions: {interaction_url}");
+                }
+            } else {
+                println!("  Discord interactions: Gateway INTERACTION_CREATE");
             }
         }
         if has_slack {
@@ -4338,7 +4366,10 @@ mod tests {
     #[test]
     fn startup_discord_connect_result_keeps_success() {
         assert_eq!(
-            startup_discord_connect_result(Ok("https://example.com/discord/interaction".into())),
+            startup_discord_connect_result(Ok(crate::transport_manager::DiscordConnectResult {
+                interaction_delivery: crate::transport_manager::DiscordInteractionDelivery::Webhook,
+                interaction_url: Some("https://example.com/discord/interaction".into()),
+            })),
             Some("https://example.com/discord/interaction".into())
         );
     }

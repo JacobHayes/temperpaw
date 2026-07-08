@@ -45,6 +45,9 @@ pub struct Config {
     /// Discord forum channel ID for per-agent threads.
     pub discord_forum_channel_id: Option<String>,
 
+    /// Discord interaction delivery mode: webhook (public Interaction URL) or gateway.
+    pub discord_interaction_delivery: Option<String>,
+
     /// Slack App-Level Token (xapp-...) for Socket Mode connection.
     pub slack_app_token: Option<String>,
 
@@ -250,6 +253,7 @@ impl Config {
             discord_guild_id: optional_env("DISCORD_GUILD_ID"),
             discord_feed_channel_id: optional_env("DISCORD_FEED_CHANNEL_ID"),
             discord_forum_channel_id: optional_env("DISCORD_FORUM_CHANNEL_ID"),
+            discord_interaction_delivery: optional_env("DISCORD_INTERACTION_DELIVERY"),
             slack_app_token: optional_env("SLACK_APP_TOKEN"),
             slack_bot_token: optional_env("SLACK_BOT_TOKEN"),
             slack_signing_secret: optional_env("SLACK_SIGNING_SECRET"),

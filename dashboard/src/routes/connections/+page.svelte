@@ -20,6 +20,7 @@
   let discordGuildId = $state('');
   let discordFeedChannelId = $state('');
   let discordForumChannelId = $state('');
+  let discordInteractionDelivery = $state<'gateway' | 'webhook'>('gateway');
   let discordConnecting = $state(false);
 
   // Slack form
@@ -62,6 +63,7 @@
         guild_id: discordGuildId || undefined,
         feed_channel_id: discordFeedChannelId || undefined,
         forum_channel_id: discordForumChannelId || undefined,
+        interaction_delivery: discordInteractionDelivery,
       });
       showDiscordForm = false;
       discordToken = '';
@@ -168,10 +170,26 @@
             <span class="label-text">Forum Channel ID</span>
             <input type="text" bind:value={discordForumChannelId} placeholder="Optional" />
           </label>
+          <label>
+            <span class="label-text">Interaction Delivery</span>
+            <select bind:value={discordInteractionDelivery}>
+              <option value="gateway">Gateway (no public URL)</option>
+              <option value="webhook">Interaction URL (public endpoint)</option>
+            </select>
+          </label>
+          <p class="form-hint">
+            Gateway mode requires clearing the Interaction URL in Discord Developer Portal. Interaction URL mode requires Discord to reach this server publicly.
+          </p>
           <button class="btn btn-primary" type="submit" disabled={discordConnecting || !discordToken}>
             {discordConnecting ? 'CONNECTING...' : 'CONNECT'}
           </button>
         </form>
+      {/if}
+
+      {#if setupStatus?.discord_interaction_delivery}
+        <div class="card-detail" style="margin-top: 0.75rem;">
+          <div style="margin-bottom: 0.35rem;">Interaction delivery: {setupStatus.discord_interaction_delivery}</div>
+        </div>
       {/if}
 
       {#if setupStatus?.discord_interaction_url}
@@ -313,7 +331,8 @@
     text-transform: uppercase;
   }
 
-  .connect-form input {
+  .connect-form input,
+  .connect-form select {
     background: var(--surface);
     border: 1px solid var(--border-strong);
     border-radius: var(--radius);
@@ -323,8 +342,16 @@
     color: var(--text-1);
   }
 
+  .form-hint {
+    margin: 0;
+    font-size: var(--text-xs);
+    color: var(--text-3);
+    line-height: 1.5;
+  }
+
   .connect-form input::placeholder { color: var(--text-3); }
-  .connect-form input:focus {
+  .connect-form input:focus,
+  .connect-form select:focus {
     outline: none;
     border-color: var(--accent);
   }

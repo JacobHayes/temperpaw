@@ -18,4 +18,4 @@ pub use gateway::{
     send_discord_message, send_discord_message_with_components, send_thread_message,
 };
 pub use observer::{ObserverConfig, run_observer};
-pub use transport::{DiscordConfig, DiscordTransport};
+pub use transport::{DiscordConfig, DiscordInteractionDelivery, DiscordTransport};

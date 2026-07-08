@@ -33,7 +33,8 @@ use crate::setup_llm::{
 };
 use crate::storage::PawStorage;
 use crate::transport_manager::{
-    DiscordConnectParams, SlackConnectParams, TransportManager, TransportStatus,
+    DiscordConnectParams, DiscordInteractionDelivery, SlackConnectParams, TransportManager,
+    TransportStatus,
 };
 
 const DEFAULT_SETUP_AGENT_TOOLS_ENABLED: &str = "temper_create,temper_get,temper_list,temper_action,temper_patch,temper_submit_specs,temper_show_spec,temper_specs,temper_upload_wasm,temper_get_trajectories,temper_get_insights,temper_get_decisions,temper_poll_decision,temper_approve_decision,temper_deny_decision,temper_submit_policy,temper_list_policies,temper_get_policy,temper_update_policy,temper_delete_policy,temper_search_apps,temper_install_app,temper_publish_app,temper_update_app,temper_list_apps,temper_spawn_session,temper_list_sessions,temper_abort_session,temper_steer_session,temper_save_memory,temper_recall_memory,temper_write,temper_write_many,temper_read,temper_run_coding_agent,temper_get_secret,temper_datadog_query,temper_railway,temper_vercel,temper_web_search,temper_web_fetch,temper_image_generate,read,write,edit,bash";
@@ -91,6 +92,7 @@ fn allowed_secret_keys() -> HashSet<&'static str> {
         "discord_guild_id",
         "discord_feed_channel_id",
         "discord_forum_channel_id",
+        "discord_interaction_delivery",
         "slack_app_token",
         "slack_bot_token",
         "slack_signing_secret",
@@ -314,6 +316,13 @@ fn secrets_schema() -> Vec<SecretSchema> {
             description: "Forum channel for agent threads",
         },
         SecretSchema {
+            key: "discord_interaction_delivery",
+            category: "messaging",
+            label: "Discord Interaction Delivery",
+            required: false,
+            description: "gateway uses the outbound Discord Gateway and needs no public URL; webhook uses the Discord Interactions Endpoint URL",
+        },
+        SecretSchema {
             key: "slack_app_token",
             category: "messaging",
             label: "Slack App Token",
@@ -478,6 +487,7 @@ struct SetupStatus {
     has_personalized_soul: bool,
     discord_connected: bool,
     slack_connected: bool,
+    discord_interaction_delivery: String,
     discord_interaction_url: Option<String>,
 }
 
@@ -775,6 +785,24 @@ fn discord_start_failure_status(error: &str) -> StatusCode {
     }
 }
 
+fn parse_discord_interaction_delivery(value: Option<&str>) -> Result<DiscordInteractionDelivery> {
+    DiscordInteractionDelivery::try_from_config_value(value).map_err(anyhow::Error::msg)
+}
+
+async fn discord_interaction_url_for_delivery(
+    state: &SetupApiState,
+    delivery: DiscordInteractionDelivery,
+) -> Option<String> {
+    if delivery.requires_public_url() {
+        state
+            .transport_manager
+            .discord_interaction_public_url()
+            .await
+    } else {
+        None
+    }
+}
+
 fn discord_connect_params_from_vault(
     state: &SetupApiState,
 ) -> Result<Option<DiscordConnectParams>> {
@@ -788,6 +816,12 @@ fn discord_connect_params_from_vault(
     else {
         return Ok(None);
     };
+
+    let interaction_delivery = parse_discord_interaction_delivery(
+        vault
+            .get_secret(&state.tenant, "discord_interaction_delivery")
+            .as_deref(),
+    )?;
 
     Ok(Some(DiscordConnectParams {
         bot_token,
@@ -803,6 +837,7 @@ fn discord_connect_params_from_vault(
         forum_channel_id: vault
             .get_secret(&state.tenant, "discord_forum_channel_id")
             .filter(|value| !value.trim().is_empty()),
+        interaction_delivery,
     }))
 }
 
@@ -930,6 +965,11 @@ async fn get_setup_status(State(state): State<SetupApiState>) -> Json<SetupStatu
         crate::transport_manager::TransportStatus::Connected { .. }
     );
     let has_personalized_soul = has_personalized_paw_soul(&state).await;
+    let discord_interaction_delivery = vault
+        .and_then(|vault| vault.get_secret(&state.tenant, "discord_interaction_delivery"))
+        .as_deref()
+        .and_then(|value| parse_discord_interaction_delivery(Some(value)).ok())
+        .unwrap_or_default();
 
     Json(SetupStatus {
         has_anthropic_key,
@@ -941,10 +981,12 @@ async fn get_setup_status(State(state): State<SetupApiState>) -> Json<SetupStatu
         has_personalized_soul,
         discord_connected,
         slack_connected,
-        discord_interaction_url: state
-            .transport_manager
-            .discord_interaction_public_url()
-            .await,
+        discord_interaction_delivery: discord_interaction_delivery.as_str().to_string(),
+        discord_interaction_url: discord_interaction_url_for_delivery(
+            &state,
+            discord_interaction_delivery,
+        )
+        .await,
     })
 }
 
@@ -1281,6 +1323,7 @@ where
             | "discord_guild_id"
             | "discord_feed_channel_id"
             | "discord_forum_channel_id"
+            | "discord_interaction_delivery"
     ) {
         return None;
     }
@@ -1306,6 +1349,15 @@ where
             updated_value,
             "discord_forum_channel_id",
         ),
+        interaction_delivery: effective_secret(
+            &get_secret,
+            updated_key,
+            updated_value,
+            "discord_interaction_delivery",
+        )
+        .as_deref()
+        .and_then(|value| parse_discord_interaction_delivery(Some(value)).ok())
+        .unwrap_or_default(),
     })
 }
 
@@ -1317,6 +1369,14 @@ async fn upsert_secret(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": error })),
+        );
+    }
+    if req.key == "discord_interaction_delivery"
+        && let Err(error) = parse_discord_interaction_delivery(Some(&req.value))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
         );
     }
 
@@ -3386,11 +3446,12 @@ async fn start_discord_internal(
     };
 
     match state.transport_manager.connect_discord(params).await {
-        Ok(interaction_url) => (
+        Ok(result) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "status": "connected",
-                "discord_interaction_url": interaction_url
+                "discord_interaction_delivery": result.interaction_delivery.as_str(),
+                "discord_interaction_url": result.interaction_url
             })),
         )
             .into_response(),
@@ -3417,6 +3478,7 @@ struct DiscordConnectRequest {
     guild_id: Option<String>,
     feed_channel_id: Option<String>,
     forum_channel_id: Option<String>,
+    interaction_delivery: Option<String>,
 }
 
 async fn connect_discord(
@@ -3432,6 +3494,19 @@ async fn connect_discord(
         )
             .into_response();
     };
+    let interaction_delivery =
+        match parse_discord_interaction_delivery(req.interaction_delivery.as_deref()) {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": error.to_string()
+                    })),
+                )
+                    .into_response();
+            }
+        };
     let resolved_public_key = match resolve_and_persist_discord_public_key(
         vault,
         &state.storage,
@@ -3470,6 +3545,10 @@ async fn connect_discord(
         ("discord_guild_id", req.guild_id.clone()),
         ("discord_feed_channel_id", req.feed_channel_id.clone()),
         ("discord_forum_channel_id", req.forum_channel_id.clone()),
+        (
+            "discord_interaction_delivery",
+            Some(interaction_delivery.as_str().to_string()),
+        ),
     ] {
         if let Some(value) = value {
             let _ = vault.cache_secret(&state.tenant, key, value.clone());
@@ -3487,7 +3566,8 @@ async fn connect_discord(
             StatusCode::OK,
             Json(serde_json::json!({
                 "status": "scheduled",
-                "discord_interaction_url": state.transport_manager.discord_interaction_public_url().await
+                "discord_interaction_delivery": interaction_delivery.as_str(),
+                "discord_interaction_url": discord_interaction_url_for_delivery(&state, interaction_delivery).await
             })),
         )
             .into_response(),
@@ -3564,7 +3644,7 @@ mod tests {
         personalized_soul_flag_value, secrets_schema, transport_status_report,
         validate_setup_secret_key, verify_discord_signature,
     };
-    use crate::transport_manager::TransportStatus;
+    use crate::transport_manager::{DiscordInteractionDelivery, TransportStatus};
     use axum::http::StatusCode;
     use ed25519_dalek::{Signer, SigningKey};
     use std::sync::Arc;
@@ -3683,6 +3763,31 @@ mod tests {
         assert_eq!(params.guild_id.as_deref(), Some("guild-123"));
         assert_eq!(params.feed_channel_id, None);
         assert_eq!(params.forum_channel_id, None);
+        assert_eq!(
+            params.interaction_delivery,
+            DiscordInteractionDelivery::Webhook
+        );
+    }
+
+    #[test]
+    fn discord_secret_update_reconnects_when_interaction_delivery_changes() {
+        let params = discord_connect_params_for_secret_update(
+            |key| match key {
+                "discord_bot_token" => Some("existing-token".to_string()),
+                "discord_public_key" => Some("pub-key".to_string()),
+                "discord_interaction_delivery" => Some("webhook".to_string()),
+                _ => None,
+            },
+            "discord_interaction_delivery",
+            "gateway",
+        )
+        .expect("discord reconnect params should be built");
+
+        assert_eq!(params.bot_token, "existing-token");
+        assert_eq!(
+            params.interaction_delivery,
+            DiscordInteractionDelivery::Gateway
+        );
     }
 
     #[test]
@@ -3899,6 +4004,20 @@ mod tests {
             resource_attributes,
             "service.name=temperpaw,service.version=build-sha,deployment.environment=prod,dd_llmobs_enabled=false"
         );
+    }
+
+    #[test]
+    fn discord_interaction_delivery_is_allowed_and_rendered() {
+        let allowed = allowed_secret_keys();
+        assert!(allowed.contains("discord_interaction_delivery"));
+
+        let schema = secrets_schema();
+        let entry = schema
+            .iter()
+            .find(|secret| secret.key == "discord_interaction_delivery")
+            .expect("discord interaction delivery should render in setup schema");
+        assert!(entry.description.contains("gateway"));
+        assert!(entry.description.contains("webhook"));
     }
 
     #[test]

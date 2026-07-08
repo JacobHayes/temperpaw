@@ -25,6 +25,7 @@ pub struct SetupResult {
     pub discord_guild_id: Option<String>,
     pub discord_feed_channel_id: Option<String>,
     pub discord_forum_channel_id: Option<String>,
+    pub discord_interaction_delivery: Option<String>,
     pub slack_app_token: Option<String>,
     pub slack_bot_token: Option<String>,
 }
@@ -107,6 +108,7 @@ pub async fn run_setup_config(config: &Config) -> anyhow::Result<SetupResult> {
         discord_guild_id: None,
         discord_feed_channel_id: None,
         discord_forum_channel_id: None,
+        discord_interaction_delivery: None,
         slack_app_token: None,
         slack_bot_token: None,
     };
@@ -558,6 +560,11 @@ pub fn merge_setup_into_config(config: &mut Config, setup: SetupResult) {
     {
         config.discord_forum_channel_id = Some(id);
     }
+    if let Some(delivery) = setup.discord_interaction_delivery
+        && config.discord_interaction_delivery.is_none()
+    {
+        config.discord_interaction_delivery = Some(delivery);
+    }
     if let Some(token) = setup.slack_app_token
         && config.slack_app_token.is_none()
     {
@@ -617,7 +624,18 @@ pub fn run_doctor(data_dir: &Path, config: &Config) {
         } else {
             println!("  ~ Discord public key (auto-fetched from bot token when available)");
         }
-        if let Some(base_url) = config.public_base_url.as_ref() {
+        let interaction_delivery =
+            crate::transport_manager::DiscordInteractionDelivery::try_from_config_value(
+                config.discord_interaction_delivery.as_deref(),
+            )
+            .unwrap_or_default();
+        println!(
+            "  \u{2713} Discord interaction delivery: {}",
+            interaction_delivery.as_str()
+        );
+        if interaction_delivery == crate::transport_manager::DiscordInteractionDelivery::Gateway {
+            println!("  \u{2713} Discord interactions use Gateway — no public URL required");
+        } else if let Some(base_url) = config.public_base_url.as_ref() {
             println!(
                 "  \u{2713} Discord interactions URL: {}/discord/interaction",
                 base_url.trim_end_matches('/')
