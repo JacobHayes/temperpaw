@@ -15,6 +15,8 @@ use tokio::sync::{RwLock, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+pub use paw_transport::discord::DiscordInteractionDelivery;
+
 pub const DISCORD_WEBHOOK_PORT: u16 = 3488;
 pub const SLACK_WEBHOOK_PORT: u16 = 3489;
 
@@ -89,6 +91,13 @@ pub struct DiscordConnectParams {
     pub guild_id: Option<String>,
     pub feed_channel_id: Option<String>,
     pub forum_channel_id: Option<String>,
+    pub interaction_delivery: DiscordInteractionDelivery,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscordConnectResult {
+    pub interaction_delivery: DiscordInteractionDelivery,
+    pub interaction_url: Option<String>,
 }
 
 /// Slack connection parameters.
@@ -256,16 +265,24 @@ impl TransportManager {
     }
 
     /// Start the Discord transport. If already connected, disconnects first.
-    pub async fn connect_discord(&self, params: DiscordConnectParams) -> anyhow::Result<String> {
+    pub async fn connect_discord(
+        &self,
+        params: DiscordConnectParams,
+    ) -> anyhow::Result<DiscordConnectResult> {
         let public_key =
             crate::discord_app::resolve_verify_key(&params.bot_token, params.public_key.as_deref())
                 .await?;
 
-        let public_base_url = self.ensure_discord_public_base_url().await?;
-        let interaction_url = format!(
-            "{}/discord/interaction",
-            public_base_url.trim_end_matches('/')
-        );
+        let interaction_delivery = params.interaction_delivery;
+        let interaction_url = if interaction_delivery.requires_public_url() {
+            let public_base_url = self.ensure_discord_public_base_url().await?;
+            Some(format!(
+                "{}/discord/interaction",
+                public_base_url.trim_end_matches('/')
+            ))
+        } else {
+            None
+        };
 
         // Disconnect existing if any
         self.disconnect_discord().await;
@@ -306,6 +323,7 @@ impl TransportManager {
                 guild_id: params.guild_id,
                 feed_channel_id: params.feed_channel_id,
                 forum_channel_id: params.forum_channel_id,
+                interaction_delivery: params.interaction_delivery,
             };
             let transport = DiscordTransport::new(config, api).with_ready_signal(ready_tx);
             let run = transport.run();
@@ -382,7 +400,10 @@ impl TransportManager {
             }
         }
 
-        Ok(interaction_url)
+        Ok(DiscordConnectResult {
+            interaction_delivery,
+            interaction_url,
+        })
     }
 
     /// Stop the Discord transport gracefully.

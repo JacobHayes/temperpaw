@@ -262,6 +262,7 @@
       const guildId = vars.find(v => v.key === 'discord_guild_id')?.value ?? '';
       const feedChannel = vars.find(v => v.key === 'discord_feed_channel_id')?.value ?? '';
       const forumChannel = vars.find(v => v.key === 'discord_forum_channel_id')?.value ?? '';
+      const interactionDelivery = (vars.find(v => v.key === 'discord_interaction_delivery')?.value || status?.discord_interaction_delivery || 'gateway') as 'gateway' | 'webhook';
       if (!botToken) { showFeedback('error', 'Set discord_bot_token first'); return; }
       const result = await connectDiscord({
         bot_token: botToken,
@@ -269,13 +270,14 @@
         guild_id: guildId || undefined,
         feed_channel_id: feedChannel || undefined,
         forum_channel_id: forumChannel || undefined,
+        interaction_delivery: interactionDelivery,
       });
       status = await fetchSetupStatus();
       const interactionUrl = result.discord_interaction_url ?? status?.discord_interaction_url;
       if (interactionUrl) {
-        showFeedback('success', 'Discord connected. Copy the Interaction URL below into Discord Developer Portal -> General Information -> Interactions Endpoint URL, then save.');
+        showFeedback('success', 'Discord connected in Interaction URL mode. Copy the URL below into Discord Developer Portal -> General Information -> Interactions Endpoint URL, then save.');
       } else {
-        showFeedback('success', 'Discord connected');
+        showFeedback('success', 'Discord connected in Gateway mode. Clear the Interaction URL in Discord Developer Portal so interactions arrive over the Gateway.');
       }
     } catch (err) {
       showFeedback('error', err instanceof Error ? err.message : 'Discord connection failed');
@@ -459,6 +461,15 @@
         {/if}
         {#if group.category === 'messaging'}
           <div class="cat-hint">Saving Discord credentials applies them immediately. Use Connect only to retry manually.</div>
+        {/if}
+        {#if group.category === 'messaging' && status?.discord_interaction_delivery}
+          <div class="cat-hint">
+            <div class="interaction-copy-row">
+              <span class="interaction-copy-label">Discord Interaction Delivery</span>
+            </div>
+            <code class="interaction-url">{status.discord_interaction_delivery}</code>
+            <div>{status.discord_interaction_delivery === 'gateway' ? 'Clear the Interactions Endpoint URL in Discord Developer Portal. Discord will deliver slash commands and buttons over the Gateway.' : 'Discord will POST interactions to the public Interactions Endpoint URL.'}</div>
+          </div>
         {/if}
         {#if group.category === 'messaging' && status?.discord_interaction_url}
           <div class="cat-hint">

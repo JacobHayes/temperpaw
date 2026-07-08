@@ -24,7 +24,7 @@ Get the user's TemperPaw instance fully operational. A complete setup has:
 
 Use `temper_get_secret` to check individual keys:
 - LLM: check `llm_provider`, `anthropic_api_key`, `openai_api_key`, `openai_codex_token`, `openrouter_api_key`
-- Discord: check `discord_bot_token`, `discord_public_key`
+- Discord: check `discord_bot_token`, `discord_public_key`, `discord_interaction_delivery`
 - Slack: check `slack_bot_token`, `slack_app_token`
 - Observability: check `dd_api_key`
 
@@ -58,7 +58,10 @@ Save all tokens, then connect:
 temper_action("save_secret", { key: "discord_bot_token", value: "<token>" })
 temper_action("save_secret", { key: "discord_public_key", value: "<key>" })
 temper_action("save_secret", { key: "discord_guild_id", value: "<id>" })
+temper_action("save_secret", { key: "discord_interaction_delivery", value: "gateway" })
 ```
+
+Use `gateway` when the TemperPaw node is private or Tailscale-only; clear the Interactions Endpoint URL in Discord Developer Portal. Use `webhook` when Discord can reach `PUBLIC_BASE_URL/discord/interaction` publicly.
 
 After saving, the platform connects Discord automatically on next startup.
 

@@ -23,6 +23,52 @@ use crate::{
     fetch_pending_decision,
 };
 
+/// How Discord interaction events (slash commands, buttons, modals) are delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscordInteractionDelivery {
+    /// Discord POSTs signed interactions to the configured Interactions Endpoint URL.
+    Webhook,
+    /// Discord sends INTERACTION_CREATE events over the existing Gateway WebSocket.
+    Gateway,
+}
+
+impl DiscordInteractionDelivery {
+    pub fn from_config_value(value: Option<&str>) -> Self {
+        Self::try_from_config_value(value).expect("valid Discord interaction delivery value")
+    }
+
+    pub fn try_from_config_value(value: Option<&str>) -> Result<Self, String> {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::Webhook);
+        };
+
+        match value.to_ascii_lowercase().as_str() {
+            "webhook" | "url" | "interaction_url" | "interactions_url" => Ok(Self::Webhook),
+            "gateway" | "gateway_interaction_create" | "interaction_create" => Ok(Self::Gateway),
+            other => Err(format!(
+                "unsupported Discord interaction delivery {other:?}; expected 'webhook' or 'gateway'"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Webhook => "webhook",
+            Self::Gateway => "gateway",
+        }
+    }
+
+    pub fn requires_public_url(self) -> bool {
+        matches!(self, Self::Webhook)
+    }
+}
+
+impl Default for DiscordInteractionDelivery {
+    fn default() -> Self {
+        Self::Webhook
+    }
+}
+
 /// Configuration for the Discord transport.
 #[derive(Debug, Clone)]
 pub struct DiscordConfig {
@@ -41,6 +87,8 @@ pub struct DiscordConfig {
     pub feed_channel_id: Option<String>,
     /// Discord forum channel ID for per-agent threads.
     pub forum_channel_id: Option<String>,
+    /// How slash commands and component interactions are received from Discord.
+    pub interaction_delivery: DiscordInteractionDelivery,
 }
 
 /// Discord channel transport.
@@ -65,6 +113,17 @@ pub struct DiscordTransport {
     typing_cancels: Arc<RwLock<BTreeMap<String, tokio::sync::watch::Sender<bool>>>>,
     /// Optional notifier used by the runtime transport manager to detect the first READY event.
     ready_signal: Option<watch::Sender<bool>>,
+}
+
+#[derive(Clone)]
+struct DiscordWebhookState {
+    http: reqwest::Client,
+    bot_token: String,
+    dm_channels: Arc<RwLock<BTreeMap<String, String>>>,
+    api: crate::PawApiClient,
+    public_key: String,
+    channel_entity_id: Arc<RwLock<Option<String>>>,
+    typing_cancels: Arc<RwLock<BTreeMap<String, tokio::sync::watch::Sender<bool>>>>,
 }
 
 struct WebhookListenerGuard {
@@ -524,6 +583,383 @@ async fn enrich_content_with_attachments(
         ));
     }
     enriched
+}
+
+async fn process_discord_interaction(
+    state: DiscordWebhookState,
+    payload: InteractionPayload,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    // Type 1 = PING (Discord verification handshake)
+    if payload.interaction_type == 1 {
+        tracing::info!("discord interaction ping responded");
+        return (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({ "type": 1 })),
+        );
+    }
+
+    // Type 2 = APPLICATION_COMMAND (slash command)
+    if payload.interaction_type == 2 {
+        let empty = serde_json::json!({});
+        let data = payload.data.as_ref().unwrap_or(&empty);
+        let command_name = data.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let command = match command_name {
+            "plan" | "execute" | "reset" => command_name.to_string(),
+            _ => {
+                return (
+                    axum::http::StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "type": 4,
+                        "data": { "content": "Unknown command.", "flags": 64 }
+                    })),
+                );
+            }
+        };
+        // Extract task/message text from slash command options.
+        // /plan and /execute use "task"; /reset uses "message".
+        let option_name = if command_name == "reset" {
+            "message"
+        } else {
+            "task"
+        };
+        let task_text = data
+            .get("options")
+            .and_then(|v| v.as_array())
+            .and_then(|opts| {
+                opts.iter()
+                    .find(|o| o.get("name").and_then(|n| n.as_str()) == Some(option_name))
+            })
+            .and_then(|o| o.get("value").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string();
+
+        // Extract user ID from interaction payload
+        let user_id = payload
+            .user
+            .as_ref()
+            .map(|u| u.id.clone())
+            .or_else(|| {
+                payload
+                    .member
+                    .as_ref()
+                    .and_then(|m| m.get("user"))
+                    .and_then(|u| u.get("id"))
+                    .and_then(|id| id.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default();
+
+        // Store DM channel mapping for reply routing
+        let channel_id = payload.channel_id.clone().unwrap_or_default();
+        let preview = truncate(&task_text, 80);
+        tracing::info!(
+            command = %command,
+            author_id = %user_id,
+            channel_id = %channel_id,
+            preview = %preview,
+            "discord slash command received"
+        );
+        let receive_span = tracing::info_span!(
+            "discord.receive",
+            otel.name = "discord.receive",
+            discord.entrypoint = "slash_command",
+            discord.command = %command,
+            discord.author_id = %user_id,
+            discord.channel_id = %channel_id,
+        );
+        if !user_id.is_empty() && !channel_id.is_empty() {
+            state
+                .dm_channels
+                .write()
+                .await
+                .insert(user_id.clone(), channel_id.clone());
+        }
+
+        let entity_id = state.channel_entity_id.read().await.clone();
+        let api = state.api.clone();
+        let http = state.http.clone();
+        let bot_token = state.bot_token.clone();
+        let app_id = payload.application_id.clone().unwrap_or_default();
+        let interaction_token = payload.token.clone();
+
+        // Dispatch ReceiveMessage asynchronously (deferred response)
+        tokio::spawn(async move {
+            let Some(entity_id) = entity_id else {
+                tracing::warn!(
+                    command = %command,
+                    author_id = %user_id,
+                    channel_id = %channel_id,
+                    "discord slash command received before channel bootstrap completed"
+                );
+                return;
+            };
+            let mut params = serde_json::json!({
+                "message_id": format!("cmd-{}", std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)),
+                "author_id": user_id,
+                "thread_id": user_id,
+                "content": task_text,
+                "command": command,
+            });
+            apply_current_trace_context(&mut params);
+            if let Err(e) = api
+                .dispatch_action(
+                    "Channels",
+                    &entity_id,
+                    "Paw.Channel.ReceiveMessage",
+                    params,
+                )
+                .await
+            {
+                tracing::warn!(
+                    command = %command,
+                    author_id = %user_id,
+                    channel_entity_id = %entity_id,
+                    error = %e,
+                    "discord slash command dispatch failed"
+                );
+                // Edit the deferred message with error
+                let _ = http
+                    .patch(format!(
+                        "{}/webhooks/{app_id}/{interaction_token}/messages/@original",
+                        DISCORD_API_BASE
+                    ))
+                    .header("Authorization", format!("Bot {bot_token}"))
+                    .json(&serde_json::json!({"content": format!("Failed to process /{command}: {e}")}))
+                    .send()
+                    .await;
+            }
+        }
+        .instrument(receive_span));
+
+        // Respond with type 5 = DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
+        return (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({ "type": 5 })),
+        );
+    }
+
+    // Type 3 = MESSAGE_COMPONENT (button click)
+    if payload.interaction_type != 3 {
+        return (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "type": 4,
+                "data": { "content": "Unsupported interaction type.", "flags": 64 }
+            })),
+        );
+    }
+
+    let Some(ref data) = payload.data else {
+        return (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "type": 4,
+                "data": { "content": "No interaction data.", "flags": 64 }
+            })),
+        );
+    };
+
+    let custom_id = data.get("custom_id").and_then(|v| v.as_str()).unwrap_or("");
+    let parts: Vec<&str> = custom_id.splitn(2, ':').collect();
+    if parts.len() != 2 {
+        return (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "type": 4,
+                "data": { "content": "Invalid button ID.", "flags": 64 }
+            })),
+        );
+    }
+
+    let (action, target_id) = (parts[0], parts[1]);
+    let is_decision_approval = approval_scope_from_action(action).is_some();
+    if !is_decision_approval
+        && action != "deny"
+        && action != "plan_approve"
+        && action != "plan_request_changes"
+    {
+        return (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "type": 4,
+                "data": { "content": "Unknown action.", "flags": 64 }
+            })),
+        );
+    }
+
+    // Extract reviewer info
+    let reviewer_id = payload
+        .user
+        .as_ref()
+        .map(|u| u.id.as_str())
+        .or_else(|| {
+            payload
+                .member
+                .as_ref()
+                .and_then(|m| m.get("user"))
+                .and_then(|u| u.get("id"))
+                .and_then(|id| id.as_str())
+        })
+        .unwrap_or("unknown")
+        .to_string();
+
+    tracing::info!(
+        action,
+        target_id,
+        reviewer_id,
+        channel_id = %payload.channel_id.clone().unwrap_or_default(),
+        "discord component interaction received"
+    );
+
+    // Process via Temper's native decisions API asynchronously
+    let api = state.api.clone();
+    let target_id_owned = target_id.to_string();
+    let action_owned = action.to_string();
+    let reviewer_id_owned = reviewer_id.clone();
+    let token = payload.token.clone();
+    let app_id = payload.application_id.clone().unwrap_or_default();
+    let http = state.http.clone();
+
+    tokio::spawn(async move {
+        let base_url = api.config().base_url.clone();
+        let tenant = api.config().tenant.clone();
+
+        // Read the original message content so we can preserve it
+        let original_content = {
+            let msg_url =
+                format!("https://discord.com/api/v10/webhooks/{app_id}/{token}/messages/@original");
+            match http.get(&msg_url).send().await {
+                Ok(resp) => resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("content").and_then(|c| c.as_str()).map(String::from))
+                    .unwrap_or_default(),
+                Err(_) => String::new(),
+            }
+        };
+
+        let (_success, status_line) = match action_owned.as_str() {
+            approval_action if approval_scope_from_action(approval_action).is_some() => {
+                let approve_url =
+                    format!("{base_url}/api/tenants/{tenant}/decisions/{target_id_owned}/approve");
+                let scope = approval_scope_from_action(approval_action)
+                    .expect("checked approval action above");
+                let decision = fetch_pending_decision(&api, &base_url, &tenant, &target_id_owned)
+                    .await
+                    .ok()
+                    .flatten();
+                match approval_body_for_scope(
+                    scope,
+                    decision.as_ref(),
+                    format!("discord:{reviewer_id_owned}"),
+                ) {
+                    Ok(body) => match api.raw_post(&approve_url, body).await {
+                        Ok(_) => (true, format!("Approval recorded by <@{reviewer_id_owned}>")),
+                        Err(e) => (false, format!("Approval failed: {e}")),
+                    },
+                    Err(e) => (false, format!("Approval failed: {e}")),
+                }
+            }
+            "deny" => {
+                let deny_url =
+                    format!("{base_url}/api/tenants/{tenant}/decisions/{target_id_owned}/deny");
+                let deny_body = serde_json::json!({
+                    "decided_by": format!("discord:{reviewer_id_owned}")
+                });
+                match api.raw_post(&deny_url, deny_body).await {
+                    Ok(_) => (true, format!("Denial recorded by <@{reviewer_id_owned}>")),
+                    Err(e) => (false, format!("Deny failed: {e}")),
+                }
+            }
+            "plan_approve" => match api
+                .dispatch_action(
+                    "Plans",
+                    &target_id_owned,
+                    "TemperPaw.Approve",
+                    serde_json::json!({}),
+                )
+                .await
+            {
+                Ok(_) => (true, format!("Plan approved by <@{reviewer_id_owned}>")),
+                Err(e) => (false, format!("Plan approval failed: {e}")),
+            },
+            "plan_request_changes" => {
+                let review_notes = format!(
+                    "Changes requested by discord:{reviewer_id_owned}. Review the plan, revise it, and resubmit for approval."
+                );
+                match api
+                    .dispatch_action(
+                        "Plans",
+                        &target_id_owned,
+                        "TemperPaw.RequestChanges",
+                        serde_json::json!({ "review_notes": review_notes }),
+                    )
+                    .await
+                {
+                    Ok(_) => (
+                        true,
+                        format!(
+                            "Plan changes requested by <@{reviewer_id_owned}>. Additional details can be sent in-thread."
+                        ),
+                    ),
+                    Err(e) => (false, format!("Request changes failed: {e}")),
+                }
+            }
+            _ => (false, "Unknown action.".to_string()),
+        };
+
+        // Build the updated message: original context + decision result
+        let message = if original_content.is_empty() {
+            status_line
+        } else {
+            let updated = if original_content.contains("**Plan Review Required**") {
+                original_content.replace(
+                    "**Plan Review Required**",
+                    &format!("~~Plan Review Required~~ **{status_line}**"),
+                )
+            } else {
+                original_content.replace(
+                    "**Permission Required**",
+                    &format!("~~Permission Required~~ **{status_line}**"),
+                )
+            };
+            // Remove the "Click a button" instruction line if present
+            updated
+                .lines()
+                .filter(|l| !l.contains("Click a button"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // Session resume/fail is now handled by GovernanceDecision.DispatchCallback
+        // effect — no transport-level orchestration needed.
+
+        // Edit the Discord message to show result
+        if !app_id.is_empty() && !token.is_empty() {
+            let follow_up_url =
+                format!("https://discord.com/api/v10/webhooks/{app_id}/{token}/messages/@original");
+            let _ = http
+                .patch(&follow_up_url)
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "content": message,
+                    "components": []
+                }))
+                .send()
+                .await;
+        }
+    });
+
+    // Respond with deferred update (type 6 = DEFERRED_UPDATE_MESSAGE)
+    // This removes the "thinking" state and we'll edit the message in the spawn above.
+    (
+        axum::http::StatusCode::OK,
+        axum::Json(serde_json::json!({ "type": 6 })),
+    )
 }
 
 impl DiscordTransport {
@@ -1229,6 +1665,11 @@ impl DiscordTransport {
                             self.handle_message_create(d).await;
                         }
                     }
+                    "INTERACTION_CREATE" => {
+                        if let Some(d) = payload.d {
+                            self.handle_interaction_create(d).await;
+                        }
+                    }
                     _ => {}
                 }
                 Ok(false)
@@ -1250,6 +1691,57 @@ impl DiscordTransport {
                 Ok(true)
             }
             _ => Ok(false),
+        }
+    }
+
+    /// Handle INTERACTION_CREATE from the Gateway interaction delivery mode.
+    async fn handle_interaction_create(&self, data: serde_json::Value) {
+        if self.config.interaction_delivery != DiscordInteractionDelivery::Gateway {
+            tracing::debug!(
+                interaction_delivery = %self.config.interaction_delivery.as_str(),
+                "discord gateway interaction ignored because webhook delivery is configured"
+            );
+            return;
+        }
+
+        let payload: InteractionPayload = match serde_json::from_value(data) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(error = %error, "discord interaction_create payload could not be parsed");
+                return;
+            }
+        };
+        let interaction_id = payload.id.clone();
+        let interaction_token = payload.token.clone();
+        let interaction_type = payload.interaction_type;
+
+        let (status, axum::Json(response)) =
+            process_discord_interaction(self.webhook_state(), payload).await;
+        if !status.is_success() {
+            tracing::warn!(
+                http_status = %status,
+                interaction_id = %interaction_id,
+                interaction_type,
+                "discord gateway interaction produced non-success local response"
+            );
+            return;
+        }
+
+        if let Err(error) = send_interaction_callback(
+            &self.http,
+            &self.config.bot_token,
+            &interaction_id,
+            &interaction_token,
+            &response,
+        )
+        .await
+        {
+            tracing::warn!(
+                interaction_id = %interaction_id,
+                interaction_type,
+                error = %error,
+                "discord gateway interaction callback failed"
+            );
         }
     }
 
@@ -1391,21 +1883,10 @@ impl DiscordTransport {
         use super::types::*;
         use axum::{Router, extract::State, routing::post};
 
-        #[derive(Clone)]
-        struct WebhookState {
-            http: reqwest::Client,
-            bot_token: String,
-            dm_channels: Arc<RwLock<BTreeMap<String, String>>>,
-            api: crate::PawApiClient,
-            public_key: String,
-            channel_entity_id: Arc<RwLock<Option<String>>>,
-            typing_cancels: Arc<RwLock<BTreeMap<String, tokio::sync::watch::Sender<bool>>>>,
-        }
-
         /// Handle reply callbacks from send_reply and request_approval WASM.
         /// Supports optional `components` field for button messages.
         async fn handle_reply(
-            State(state): State<WebhookState>,
+            State(state): State<DiscordWebhookState>,
             axum::Json(body): axum::Json<serde_json::Value>,
         ) -> axum::http::StatusCode {
             let thread_id = body.get("thread_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -1575,7 +2056,7 @@ impl DiscordTransport {
         /// We verify the Ed25519 signature, respond with a deferred ack,
         /// then dispatch the Temper action asynchronously.
         async fn handle_interaction(
-            State(state): State<WebhookState>,
+            State(state): State<DiscordWebhookState>,
             headers: axum::http::HeaderMap,
             body: axum::body::Bytes,
         ) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
@@ -1614,401 +2095,14 @@ impl DiscordTransport {
                 }
             };
 
-            // Type 1 = PING (Discord verification handshake)
-            if payload.interaction_type == 1 {
-                tracing::info!("discord interaction ping responded");
-                return (
-                    axum::http::StatusCode::OK,
-                    axum::Json(serde_json::json!({ "type": 1 })),
-                );
-            }
-
-            // Type 2 = APPLICATION_COMMAND (slash command)
-            if payload.interaction_type == 2 {
-                let empty = serde_json::json!({});
-                let data = payload.data.as_ref().unwrap_or(&empty);
-                let command_name = data.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let command = match command_name {
-                    "plan" | "execute" | "reset" => command_name.to_string(),
-                    _ => {
-                        return (
-                            axum::http::StatusCode::OK,
-                            axum::Json(serde_json::json!({
-                                "type": 4,
-                                "data": { "content": "Unknown command.", "flags": 64 }
-                            })),
-                        );
-                    }
-                };
-                // Extract task/message text from slash command options.
-                // /plan and /execute use "task"; /reset uses "message".
-                let option_name = if command_name == "reset" {
-                    "message"
-                } else {
-                    "task"
-                };
-                let task_text = data
-                    .get("options")
-                    .and_then(|v| v.as_array())
-                    .and_then(|opts| {
-                        opts.iter()
-                            .find(|o| o.get("name").and_then(|n| n.as_str()) == Some(option_name))
-                    })
-                    .and_then(|o| o.get("value").and_then(|v| v.as_str()))
-                    .unwrap_or("")
-                    .to_string();
-
-                // Extract user ID from interaction payload
-                let user_id = payload
-                    .user
-                    .as_ref()
-                    .map(|u| u.id.clone())
-                    .or_else(|| {
-                        payload
-                            .member
-                            .as_ref()
-                            .and_then(|m| m.get("user"))
-                            .and_then(|u| u.get("id"))
-                            .and_then(|id| id.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .unwrap_or_default();
-
-                // Store DM channel mapping for reply routing
-                let channel_id = payload.channel_id.clone().unwrap_or_default();
-                let preview = truncate(&task_text, 80);
-                tracing::info!(
-                    command = %command,
-                    author_id = %user_id,
-                    channel_id = %channel_id,
-                    preview = %preview,
-                    "discord slash command received"
-                );
-                let receive_span = tracing::info_span!(
-                    "discord.receive",
-                    otel.name = "discord.receive",
-                    discord.entrypoint = "slash_command",
-                    discord.command = %command,
-                    discord.author_id = %user_id,
-                    discord.channel_id = %channel_id,
-                );
-                if !user_id.is_empty() && !channel_id.is_empty() {
-                    state
-                        .dm_channels
-                        .write()
-                        .await
-                        .insert(user_id.clone(), channel_id.clone());
-                }
-
-                let entity_id = state.channel_entity_id.read().await.clone();
-                let api = state.api.clone();
-                let http = state.http.clone();
-                let bot_token = state.bot_token.clone();
-                let app_id = payload.application_id.clone().unwrap_or_default();
-                let interaction_token = payload.token.clone();
-
-                // Dispatch ReceiveMessage asynchronously (deferred response)
-                tokio::spawn(async move {
-                    let Some(entity_id) = entity_id else {
-                        tracing::warn!(
-                            command = %command,
-                            author_id = %user_id,
-                            channel_id = %channel_id,
-                            "discord slash command received before channel bootstrap completed"
-                        );
-                        return;
-                    };
-                    let mut params = serde_json::json!({
-                        "message_id": format!("cmd-{}", std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis())
-                            .unwrap_or(0)),
-                        "author_id": user_id,
-                        "thread_id": user_id,
-                        "content": task_text,
-                        "command": command,
-                    });
-                    apply_current_trace_context(&mut params);
-                    if let Err(e) = api
-                        .dispatch_action(
-                            "Channels",
-                            &entity_id,
-                            "Paw.Channel.ReceiveMessage",
-                            params,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            command = %command,
-                            author_id = %user_id,
-                            channel_entity_id = %entity_id,
-                            error = %e,
-                            "discord slash command dispatch failed"
-                        );
-                        // Edit the deferred message with error
-                        let _ = http
-                            .patch(format!(
-                                "{}/webhooks/{app_id}/{interaction_token}/messages/@original",
-                                DISCORD_API_BASE
-                            ))
-                            .header("Authorization", format!("Bot {bot_token}"))
-                            .json(&serde_json::json!({"content": format!("Failed to process /{command}: {e}")}))
-                            .send()
-                            .await;
-                    }
-                }
-                .instrument(receive_span));
-
-                // Respond with type 5 = DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
-                return (
-                    axum::http::StatusCode::OK,
-                    axum::Json(serde_json::json!({ "type": 5 })),
-                );
-            }
-
-            // Type 3 = MESSAGE_COMPONENT (button click)
-            if payload.interaction_type != 3 {
-                return (
-                    axum::http::StatusCode::OK,
-                    axum::Json(serde_json::json!({
-                        "type": 4,
-                        "data": { "content": "Unsupported interaction type.", "flags": 64 }
-                    })),
-                );
-            }
-
-            let Some(ref data) = payload.data else {
-                return (
-                    axum::http::StatusCode::OK,
-                    axum::Json(serde_json::json!({
-                        "type": 4,
-                        "data": { "content": "No interaction data.", "flags": 64 }
-                    })),
-                );
-            };
-
-            let custom_id = data.get("custom_id").and_then(|v| v.as_str()).unwrap_or("");
-            let parts: Vec<&str> = custom_id.splitn(2, ':').collect();
-            if parts.len() != 2 {
-                return (
-                    axum::http::StatusCode::OK,
-                    axum::Json(serde_json::json!({
-                        "type": 4,
-                        "data": { "content": "Invalid button ID.", "flags": 64 }
-                    })),
-                );
-            }
-
-            let (action, target_id) = (parts[0], parts[1]);
-            let is_decision_approval = approval_scope_from_action(action).is_some();
-            if !is_decision_approval
-                && action != "deny"
-                && action != "plan_approve"
-                && action != "plan_request_changes"
-            {
-                return (
-                    axum::http::StatusCode::OK,
-                    axum::Json(serde_json::json!({
-                        "type": 4,
-                        "data": { "content": "Unknown action.", "flags": 64 }
-                    })),
-                );
-            }
-
-            // Extract reviewer info
-            let reviewer_id = payload
-                .user
-                .as_ref()
-                .map(|u| u.id.as_str())
-                .or_else(|| {
-                    payload
-                        .member
-                        .as_ref()
-                        .and_then(|m| m.get("user"))
-                        .and_then(|u| u.get("id"))
-                        .and_then(|id| id.as_str())
-                })
-                .unwrap_or("unknown")
-                .to_string();
-
-            tracing::info!(
-                action,
-                target_id,
-                reviewer_id,
-                channel_id = %payload.channel_id.clone().unwrap_or_default(),
-                "discord component interaction received"
-            );
-
-            // Process via Temper's native decisions API asynchronously
-            let api = state.api.clone();
-            let target_id_owned = target_id.to_string();
-            let action_owned = action.to_string();
-            let reviewer_id_owned = reviewer_id.clone();
-            let token = payload.token.clone();
-            let app_id = payload.application_id.clone().unwrap_or_default();
-            let http = state.http.clone();
-
-            tokio::spawn(async move {
-                let base_url = api.config().base_url.clone();
-                let tenant = api.config().tenant.clone();
-
-                // Read the original message content so we can preserve it
-                let original_content = {
-                    let msg_url = format!(
-                        "https://discord.com/api/v10/webhooks/{app_id}/{token}/messages/@original"
-                    );
-                    match http.get(&msg_url).send().await {
-                        Ok(resp) => resp
-                            .json::<serde_json::Value>()
-                            .await
-                            .ok()
-                            .and_then(|v| {
-                                v.get("content").and_then(|c| c.as_str()).map(String::from)
-                            })
-                            .unwrap_or_default(),
-                        Err(_) => String::new(),
-                    }
-                };
-
-                let (_success, status_line) = match action_owned.as_str() {
-                    approval_action if approval_scope_from_action(approval_action).is_some() => {
-                        let approve_url = format!(
-                            "{base_url}/api/tenants/{tenant}/decisions/{target_id_owned}/approve"
-                        );
-                        let scope = approval_scope_from_action(approval_action)
-                            .expect("checked approval action above");
-                        let decision =
-                            fetch_pending_decision(&api, &base_url, &tenant, &target_id_owned)
-                                .await
-                                .ok()
-                                .flatten();
-                        match approval_body_for_scope(
-                            scope,
-                            decision.as_ref(),
-                            format!("discord:{reviewer_id_owned}"),
-                        ) {
-                            Ok(body) => match api.raw_post(&approve_url, body).await {
-                                Ok(_) => {
-                                    (true, format!("Approval recorded by <@{reviewer_id_owned}>"))
-                                }
-                                Err(e) => (false, format!("Approval failed: {e}")),
-                            },
-                            Err(e) => (false, format!("Approval failed: {e}")),
-                        }
-                    }
-                    "deny" => {
-                        let deny_url = format!(
-                            "{base_url}/api/tenants/{tenant}/decisions/{target_id_owned}/deny"
-                        );
-                        let deny_body = serde_json::json!({
-                            "decided_by": format!("discord:{reviewer_id_owned}")
-                        });
-                        match api.raw_post(&deny_url, deny_body).await {
-                            Ok(_) => (true, format!("Denial recorded by <@{reviewer_id_owned}>")),
-                            Err(e) => (false, format!("Deny failed: {e}")),
-                        }
-                    }
-                    "plan_approve" => match api
-                        .dispatch_action(
-                            "Plans",
-                            &target_id_owned,
-                            "TemperPaw.Approve",
-                            serde_json::json!({}),
-                        )
-                        .await
-                    {
-                        Ok(_) => (true, format!("Plan approved by <@{reviewer_id_owned}>")),
-                        Err(e) => (false, format!("Plan approval failed: {e}")),
-                    },
-                    "plan_request_changes" => {
-                        let review_notes = format!(
-                            "Changes requested by discord:{reviewer_id_owned}. Review the plan, revise it, and resubmit for approval."
-                        );
-                        match api
-                            .dispatch_action(
-                                "Plans",
-                                &target_id_owned,
-                                "TemperPaw.RequestChanges",
-                                serde_json::json!({ "review_notes": review_notes }),
-                            )
-                            .await
-                        {
-                            Ok(_) => (
-                                true,
-                                format!(
-                                    "Plan changes requested by <@{reviewer_id_owned}>. Additional details can be sent in-thread."
-                                ),
-                            ),
-                            Err(e) => (false, format!("Request changes failed: {e}")),
-                        }
-                    }
-                    _ => (false, "Unknown action.".to_string()),
-                };
-
-                // Build the updated message: original context + decision result
-                let message = if original_content.is_empty() {
-                    status_line
-                } else {
-                    let updated = if original_content.contains("**Plan Review Required**") {
-                        original_content.replace(
-                            "**Plan Review Required**",
-                            &format!("~~Plan Review Required~~ **{status_line}**"),
-                        )
-                    } else {
-                        original_content.replace(
-                            "**Permission Required**",
-                            &format!("~~Permission Required~~ **{status_line}**"),
-                        )
-                    };
-                    // Remove the "Click a button" instruction line if present
-                    updated
-                        .lines()
-                        .filter(|l| !l.contains("Click a button"))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
-
-                // Session resume/fail is now handled by GovernanceDecision.DispatchCallback
-                // effect — no transport-level orchestration needed.
-
-                // Edit the Discord message to show result
-                if !app_id.is_empty() && !token.is_empty() {
-                    let follow_up_url = format!(
-                        "https://discord.com/api/v10/webhooks/{app_id}/{token}/messages/@original"
-                    );
-                    let _ = http
-                        .patch(&follow_up_url)
-                        .header("Content-Type", "application/json")
-                        .json(&serde_json::json!({
-                            "content": message,
-                            "components": []
-                        }))
-                        .send()
-                        .await;
-                }
-            });
-
-            // Respond with deferred update (type 6 = DEFERRED_UPDATE_MESSAGE)
-            // This removes the "thinking" state and we'll edit the message in the spawn above.
-            (
-                axum::http::StatusCode::OK,
-                axum::Json(serde_json::json!({ "type": 6 })),
-            )
+            process_discord_interaction(state, payload).await
         }
 
-        let webhook_state = WebhookState {
-            http: self.http.clone(),
-            bot_token: self.config.bot_token.clone(),
-            dm_channels: self.dm_channels.clone(),
-            api: self.api.clone(),
-            public_key: self.config.public_key.clone(),
-            channel_entity_id: self.channel_entity_id.clone(),
-            typing_cancels: self.typing_cancels.clone(),
-        };
+        let webhook_state = self.webhook_state();
 
         /// Handle typing indicator requests from WASM modules.
         async fn handle_typing(
-            State(state): State<WebhookState>,
+            State(state): State<DiscordWebhookState>,
             axum::Json(body): axum::Json<serde_json::Value>,
         ) -> axum::http::StatusCode {
             let thread_id = body.get("thread_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -2061,6 +2155,48 @@ impl DiscordTransport {
 
         Ok(WebhookListenerGuard::new(actual_port, shutdown_tx, task))
     }
+
+    fn webhook_state(&self) -> DiscordWebhookState {
+        DiscordWebhookState {
+            http: self.http.clone(),
+            bot_token: self.config.bot_token.clone(),
+            dm_channels: self.dm_channels.clone(),
+            api: self.api.clone(),
+            public_key: self.config.public_key.clone(),
+            channel_entity_id: self.channel_entity_id.clone(),
+            typing_cancels: self.typing_cancels.clone(),
+        }
+    }
+}
+
+async fn send_interaction_callback(
+    http: &reqwest::Client,
+    bot_token: &str,
+    interaction_id: &str,
+    interaction_token: &str,
+    response: &serde_json::Value,
+) -> Result<(), String> {
+    let url =
+        format!("{DISCORD_API_BASE}/interactions/{interaction_id}/{interaction_token}/callback");
+    let resp = http
+        .post(&url)
+        .header("Authorization", format!("Bot {bot_token}"))
+        .header("Content-Type", "application/json")
+        .json(response)
+        .send()
+        .await
+        .map_err(|error| format!("Discord interaction callback request failed: {error}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "Discord interaction callback returned {status}: {}",
+            body.trim()
+        ));
+    }
+
+    Ok(())
 }
 
 /// Verify a Discord interaction signature using Ed25519.
@@ -2230,6 +2366,40 @@ mod tests {
     }
 
     #[test]
+    fn discord_interaction_delivery_parses_config_values() {
+        assert_eq!(
+            DiscordInteractionDelivery::from_config_value(None),
+            DiscordInteractionDelivery::Webhook
+        );
+        assert_eq!(
+            DiscordInteractionDelivery::from_config_value(Some("")),
+            DiscordInteractionDelivery::Webhook
+        );
+        assert_eq!(
+            DiscordInteractionDelivery::from_config_value(Some("gateway")),
+            DiscordInteractionDelivery::Gateway
+        );
+        assert_eq!(
+            DiscordInteractionDelivery::from_config_value(Some("gateway_interaction_create")),
+            DiscordInteractionDelivery::Gateway
+        );
+        assert_eq!(
+            DiscordInteractionDelivery::from_config_value(Some("interaction_url")),
+            DiscordInteractionDelivery::Webhook
+        );
+        assert_eq!(
+            DiscordInteractionDelivery::from_config_value(Some("webhook")),
+            DiscordInteractionDelivery::Webhook
+        );
+    }
+
+    #[test]
+    fn gateway_interaction_delivery_does_not_require_public_url() {
+        assert!(!DiscordInteractionDelivery::Gateway.requires_public_url());
+        assert!(DiscordInteractionDelivery::Webhook.requires_public_url());
+    }
+
+    #[test]
     fn discord_ingress_logging_uses_tracing() {
         let writer = SharedWriter::default();
         let subscriber = tracing_subscriber::fmt()
@@ -2358,6 +2528,7 @@ mod tests {
                 guild_id: None,
                 feed_channel_id: None,
                 forum_channel_id: None,
+                interaction_delivery: DiscordInteractionDelivery::Webhook,
             },
             api,
         );
@@ -2449,6 +2620,7 @@ mod tests {
                 guild_id: None,
                 feed_channel_id: None,
                 forum_channel_id: None,
+                interaction_delivery: DiscordInteractionDelivery::Webhook,
             },
             api,
         );
@@ -2628,6 +2800,7 @@ mod tests {
                 guild_id: None,
                 feed_channel_id: None,
                 forum_channel_id: None,
+                interaction_delivery: DiscordInteractionDelivery::Webhook,
             },
             api,
         );
