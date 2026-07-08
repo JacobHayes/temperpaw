@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import {
     fetchSecretsSchema,
     fetchSetupStatus,
@@ -50,6 +50,28 @@
   let connectingSlack = $state(false);
   let connectingCodex = $state(false);
   let codexStatus = $state<OpenAICodexAuthStatus | null>(null);
+  // Codex device-code sign-in flow
+  let codexStarting = $state(false); // device-code request in flight (before code appears)
+  let codexPolling = $state(false); // a poll request (manual or background) is in flight
+  let codexPollTimer: ReturnType<typeof setInterval> | null = null;
+  let codexPollDeadlineMs = 0;
+  const CODEX_POLL_INTERVAL_MS = 5000; // backend advertises poll_interval_ms=5000
+  const CODEX_POLL_MAX_WALL_MS = 15 * 60 * 1000; // hard stop after 15 min
+
+  // Entity states where a device code is pending user authorization.
+  const CODEX_PENDING_STATES = ['Starting', 'DeviceCodeReady', 'Polling'];
+  function codexIsAwaitingCode(s: OpenAICodexAuthStatus | null): boolean {
+    return !!s?.user_code && !s.configured && CODEX_PENDING_STATES.includes(s.status ?? '');
+  }
+  // Set once the device code's expiry passes. The backend entity stays in
+  // DeviceCodeReady holding the stale code, so without this flag the UI would
+  // keep showing the dead code and leave "Sign in" disabled forever.
+  let codexExpired = $state(false);
+  // Only show the device-code block while genuinely awaiting authorization. Once
+  // the flow completes (Ready/configured) the entity keeps the stale user_code,
+  // so gating on this derived value clears the block on success — and on expiry,
+  // re-enabling "Sign in" (StartDeviceLogin mints a fresh code).
+  let codexAwaitingCode = $derived(!codexExpired && codexIsAwaitingCode(codexStatus));
 
   // Account
   let apiKey = $state('');
@@ -324,33 +346,88 @@
   }
 
   async function handleStartCodexLogin() {
-    connectingCodex = true;
+    codexStarting = true;
     feedback = null;
     try {
       codexStatus = await startOpenAICodexDeviceLogin();
-      showFeedback('success', 'OpenAI Codex device login started');
-    } catch (err) {
-      showFeedback('error', err instanceof Error ? err.message : 'OpenAI Codex login failed');
-    } finally { connectingCodex = false; }
-  }
-
-  async function handlePollCodexLogin() {
-    connectingCodex = true;
-    feedback = null;
-    try {
-      codexStatus = await pollOpenAICodexDeviceLogin();
-      status = await fetchSetupStatus();
-      if (codexStatus.configured) {
-        showFeedback('success', 'OpenAI Codex connected');
-        await load();
+      codexExpired = false;
+      if (codexStatus.user_code) {
+        // No banner here: the device-code block below already explains what to
+        // do, and a transient duplicate above it makes the layout jump.
+        startCodexBackgroundPoll();
+      } else {
+        showFeedback('success', 'OpenAI Codex device login started');
       }
     } catch (err) {
-      showFeedback('error', err instanceof Error ? err.message : 'OpenAI Codex polling failed');
-    } finally { connectingCodex = false; }
+      showFeedback('error', err instanceof Error ? err.message : 'OpenAI Codex login failed');
+    } finally { codexStarting = false; }
+  }
+
+  function codexExpiryMs(): number {
+    const raw = codexStatus?.expires_at_ms;
+    const parsed = raw ? Number(raw) : NaN;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+
+  function stopCodexBackgroundPoll() {
+    if (codexPollTimer !== null) {
+      clearInterval(codexPollTimer);
+      codexPollTimer = null;
+    }
+  }
+
+  function startCodexBackgroundPoll() {
+    stopCodexBackgroundPoll();
+    const cap = Date.now() + CODEX_POLL_MAX_WALL_MS;
+    const expiry = codexExpiryMs();
+    codexPollDeadlineMs = expiry > 0 ? Math.min(expiry, cap) : cap;
+    codexPollTimer = setInterval(() => { void codexBackgroundTick(); }, CODEX_POLL_INTERVAL_MS);
+  }
+
+  async function codexBackgroundTick() {
+    if (codexPolling) return; // don't overlap in-flight polls
+    if (Date.now() >= codexPollDeadlineMs) {
+      stopCodexBackgroundPoll();
+      codexExpired = true;
+      showFeedback('error', 'OpenAI Codex device code expired. Start sign-in again.');
+      return;
+    }
+    await runCodexPoll(false);
+  }
+
+  // Shared poll used by both the manual "Check" button and the background timer.
+  async function runCodexPoll(manual: boolean): Promise<void> {
+    if (codexPolling) return;
+    codexPolling = true;
+    if (manual) feedback = null;
+    try {
+      const next = await pollOpenAICodexDeviceLogin();
+      codexStatus = next;
+      if (next.configured) {
+        stopCodexBackgroundPoll();
+        status = await fetchSetupStatus();
+        showFeedback('success', 'OpenAI Codex connected');
+        await load();
+        return;
+      }
+      if (next.status === 'Failed') {
+        stopCodexBackgroundPoll();
+        showFeedback('error', next.last_error || 'OpenAI Codex sign-in failed');
+      }
+    } catch (err) {
+      // Surface manual errors; swallow transient background errors and keep
+      // retrying until the deadline.
+      if (manual) {
+        showFeedback('error', err instanceof Error ? err.message : 'OpenAI Codex polling failed');
+      }
+    } finally {
+      codexPolling = false;
+    }
   }
 
   async function handleDisconnectCodex() {
     connectingCodex = true;
+    stopCodexBackgroundPoll();
     try {
       codexStatus = await disconnectOpenAICodexAuth();
       status = await fetchSetupStatus();
@@ -360,6 +437,24 @@
       showFeedback('error', err instanceof Error ? err.message : 'OpenAI Codex disconnect failed');
     } finally { connectingCodex = false; }
   }
+
+  // Resume background polling if a device-code flow is already pending on mount
+  // (e.g. the user navigated away and came back), and always clean up on destroy.
+  $effect(() => {
+    if (!codexAwaitingCode) return;
+    const expiry = codexExpiryMs();
+    if (expiry > 0 && Date.now() >= expiry) {
+      // Already expired when we got here (e.g. the user stepped away and
+      // reloaded the page): skip polling and unlock "Sign in" right away.
+      codexExpired = true;
+      return;
+    }
+    if (codexPollTimer === null) startCodexBackgroundPoll();
+  });
+
+  onDestroy(() => {
+    stopCodexBackgroundPoll();
+  });
 
   async function updatePassword() {
     accountFeedback = null;
@@ -440,21 +535,33 @@
                   <span class="cat-dot cat-dot--on"></span> Codex <span class="cat-act-label">Disconnect</span>
                 </button>
               {:else}
-                <button class="cat-act" onclick={handleStartCodexLogin} disabled={connectingCodex}>
-                  <span class="cat-dot"></span> Codex <span class="cat-act-label">Sign in</span>
+                <button class="cat-act" onclick={handleStartCodexLogin} disabled={codexStarting || codexAwaitingCode}>
+                  {#if codexStarting}
+                    <span class="spinner spinner--sm"></span> Codex <span class="cat-act-label">Requesting code…</span>
+                  {:else if codexAwaitingCode}
+                    <span class="cat-dot"></span> Codex <span class="cat-act-label">Awaiting code…</span>
+                  {:else}
+                    <span class="cat-dot"></span> Codex <span class="cat-act-label">Sign in</span>
+                  {/if}
                 </button>
               {/if}
             </div>
           {/if}
         </div>
-        {#if group.category === 'llm' && codexStatus?.user_code}
+        {#if group.category === 'llm' && codexAwaitingCode}
           <div class="cat-hint">
             <div class="interaction-copy-row">
               <span class="interaction-copy-label">OpenAI Codex Device Code</span>
-              <button class="act" onclick={handlePollCodexLogin} disabled={connectingCodex}>Check</button>
+              <button class="act" onclick={() => runCodexPoll(true)} disabled={codexPolling}>
+                {codexPolling ? 'Checking…' : 'Check'}
+              </button>
             </div>
-            <code class="interaction-url">{codexStatus.user_code}</code>
-            <div><a href={codexStatus.verification_url} target="_blank" rel="noreferrer">{codexStatus.verification_url}</a></div>
+            <code class="interaction-url">{codexStatus?.user_code}</code>
+            <div><a href={codexStatus?.verification_url} target="_blank" rel="noreferrer">{codexStatus?.verification_url}</a></div>
+            <div class="codex-poll-status">
+              <span class="spinner spinner--sm"></span>
+              Open the link, enter the code, and authorize — checking automatically every 5s.
+            </div>
           </div>
         {/if}
         {#if group.category === 'messaging'}
@@ -655,6 +762,36 @@
     color: var(--text-3);
     padding: 0 0 var(--sp-1) 0;
     word-break: break-all;
+  }
+
+  .codex-poll-status {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    margin-top: var(--sp-1);
+    color: var(--text-3);
+  }
+
+  .spinner {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border: 1.5px solid var(--text-3);
+    border-top-color: var(--text-1);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    flex-shrink: 0;
+    vertical-align: middle;
+  }
+
+  .spinner--sm {
+    width: 8px;
+    height: 8px;
+    border-width: 1px;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
   }
 
   /* ── Variable row ── */

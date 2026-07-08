@@ -98,12 +98,28 @@ fn start_device_login(ctx: &Context) -> Result<(), String> {
     Ok(())
 }
 
+/// OpenAI keeps answering 403/404 ("pending") for a device code that already
+/// expired, so without this check the entity would report DeviceCodeReady
+/// forever. Unparseable or absent deadlines never block polling.
+fn device_code_expired(expires_at_ms: Option<&str>, now_ms: i64) -> bool {
+    matches!(
+        expires_at_ms.and_then(|v| v.parse::<i64>().ok()),
+        Some(deadline) if deadline > 0 && now_ms >= deadline
+    )
+}
+
 fn poll_device_login(ctx: &Context, fields: &Value) -> Result<(), String> {
     let auth_base_url = auth_base_url(ctx);
     let device_auth_id = field_str(fields, "device_auth_id")
         .ok_or("OpenAI Codex auth missing device_auth_id; start device login first")?;
     let user_code = field_str(fields, "user_code")
         .ok_or("OpenAI Codex auth missing user_code; start device login first")?;
+    if device_code_expired(
+        field_str(fields, "expires_at_ms"),
+        Context::get_time_millis() as i64,
+    ) {
+        return Err("OpenAI Codex device code expired; start sign-in again".to_string());
+    }
     let body = json!({
         "device_auth_id": device_auth_id,
         "user_code": user_code,
@@ -442,6 +458,18 @@ mod tests {
         assert_eq!(parsed.access_token, "a");
         assert_eq!(parsed.refresh_token, "r");
         assert!(parsed.expires_at_ms >= 10_000);
+    }
+
+    #[test]
+    fn device_code_expiry_check_only_fires_past_a_valid_deadline() {
+        assert!(device_code_expired(Some("1000"), 1000));
+        assert!(device_code_expired(Some("1000"), 2000));
+        assert!(!device_code_expired(Some("1000"), 999));
+        // Missing/blank/garbage deadlines never block polling.
+        assert!(!device_code_expired(None, 2000));
+        assert!(!device_code_expired(Some(""), 2000));
+        assert!(!device_code_expired(Some("not-a-number"), 2000));
+        assert!(!device_code_expired(Some("0"), 2000));
     }
 
     #[test]
