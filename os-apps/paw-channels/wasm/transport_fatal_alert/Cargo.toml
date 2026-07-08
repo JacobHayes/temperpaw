@@ -1,0 +1,12 @@
+[package]
+name = "transport-fatal-alert"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+
+[dependencies]
+temper-wasm-sdk = { git = "https://github.com/nerdsane/temper.git", rev = "1a57fb0c9cfc935135550b5d88fbd49afcfabb9e" }

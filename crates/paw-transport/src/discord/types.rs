@@ -397,6 +397,32 @@ pub struct GatewayBotResponse {
     pub url: String,
     #[serde(default)]
     pub shards: u32,
+    /// Discord's identify (session start) rate-limit budget for this bot.
+    /// Omitted on some edge responses, so it is optional and defaulted.
+    #[serde(default)]
+    pub session_start_limit: Option<SessionStartLimit>,
+}
+
+/// Discord's `session_start_limit` object from `GET /gateway/bot`.
+///
+/// Governs how many times the bot may IDENTIFY (open a fresh gateway session)
+/// before Discord temporarily refuses further sessions. Exhausting it is what
+/// gets a bot penalized / its token reset, so the transport treats a
+/// near-exhausted budget as a reason to wait rather than IDENTIFY.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct SessionStartLimit {
+    /// Total number of session starts allowed per reset window.
+    #[serde(default)]
+    pub total: u32,
+    /// Remaining session starts in the current window.
+    #[serde(default)]
+    pub remaining: u32,
+    /// Milliseconds until `remaining` resets back to `total`.
+    #[serde(default)]
+    pub reset_after: u64,
+    /// How many shards may IDENTIFY concurrently.
+    #[serde(default)]
+    pub max_concurrency: u32,
 }
 
 /// Response from creating a forum post thread.
@@ -482,6 +508,35 @@ mod tests {
         assert_eq!(msg.attachments.len(), 2);
         assert_eq!(msg.attachments[0].filename, "readme.md");
         assert_eq!(msg.attachments[1].filename, "photo.png");
+    }
+
+    #[test]
+    fn gateway_bot_response_parses_session_start_limit() {
+        let json = serde_json::json!({
+            "url": "wss://gateway.discord.gg",
+            "shards": 1,
+            "session_start_limit": {
+                "total": 1000,
+                "remaining": 3,
+                "reset_after": 14_400_000u64,
+                "max_concurrency": 1
+            }
+        });
+        let resp: GatewayBotResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.url, "wss://gateway.discord.gg");
+        let limit = resp.session_start_limit.expect("limit present");
+        assert_eq!(limit.total, 1000);
+        assert_eq!(limit.remaining, 3);
+        assert_eq!(limit.reset_after, 14_400_000);
+        assert_eq!(limit.max_concurrency, 1);
+    }
+
+    #[test]
+    fn gateway_bot_response_without_session_start_limit_is_tolerated() {
+        // Older/edge responses may omit it; parsing must not fail.
+        let json = serde_json::json!({ "url": "wss://gateway.discord.gg" });
+        let resp: GatewayBotResponse = serde_json::from_value(json).unwrap();
+        assert!(resp.session_start_limit.is_none());
     }
 
     #[test]

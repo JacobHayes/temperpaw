@@ -69,7 +69,7 @@ permit(
 
 permit(
   principal,
-  action in [Action::"StartSucceeded", Action::"StartRetry", Action::"RetryDue", Action::"StartFailed", Action::"MarkDisconnected"],
+  action in [Action::"StartSucceeded", Action::"StartRetry", Action::"RetryDue", Action::"StartFailed", Action::"MarkDisconnected", Action::"AlertRecorded"],
   resource is TransportConnection
 ) when {
   principal.agent_type == "system"
@@ -135,7 +135,7 @@ permit(
   action == Action::"http_call",
   resource is HttpEndpoint
 ) when {
-  ["channel_connect", "route_message", "send_reply", "transport_reconcile"].contains(context.module)
+  ["channel_connect", "route_message", "send_reply", "transport_reconcile", "transport_fatal_alert"].contains(context.module)
 };
 
 permit(
@@ -143,5 +143,5 @@ permit(
   action == Action::"http_call",
   resource is HttpEndpoint
 ) when {
-  ["transport_reconcile", "transport-reconcile"].contains(context.module)
+  ["transport_reconcile", "transport-reconcile", "transport_fatal_alert", "transport-fatal-alert"].contains(context.module)
 };

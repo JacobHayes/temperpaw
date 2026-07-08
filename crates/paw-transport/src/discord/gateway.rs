@@ -53,11 +53,11 @@ impl GatewayState {
     }
 }
 
-/// Fetch the Gateway bot URL from Discord REST API.
-pub(crate) async fn fetch_gateway_url(
+/// Fetch the Gateway bot info (URL + identify budget) from Discord REST API.
+pub(crate) async fn fetch_gateway_bot(
     http: &reqwest::Client,
     bot_token: &str,
-) -> Result<String, String> {
+) -> Result<GatewayBotResponse, String> {
     let resp = http
         .get(format!("{DISCORD_API_BASE}/gateway/bot"))
         .header("Authorization", format!("Bot {bot_token}"))
@@ -68,15 +68,19 @@ pub(crate) async fn fetch_gateway_url(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        if super::backoff::rest_status_is_fatal(status.as_u16()) {
+            // Bad token / lacks access — retrying will never succeed.
+            return Err(format!(
+                "Gateway bot endpoint returned {status} (fatal auth failure): {body}. \
+                 Check the Discord bot token."
+            ));
+        }
         return Err(format!("Gateway bot endpoint returned {status}: {body}"));
     }
 
-    let bot_resp: GatewayBotResponse = resp
-        .json()
+    resp.json::<GatewayBotResponse>()
         .await
-        .map_err(|e| format!("Failed to parse gateway response: {e}"))?;
-
-    Ok(bot_resp.url)
+        .map_err(|e| format!("Failed to parse gateway response: {e}"))
 }
 
 /// Type alias for the WebSocket write half.

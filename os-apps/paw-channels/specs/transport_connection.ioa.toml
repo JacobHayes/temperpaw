@@ -46,6 +46,21 @@ name = "attempt_count"
 type = "counter"
 initial = "0"
 
+[[state]]
+name = "last_alert_at"
+type = "string"
+initial = ""
+
+[[state]]
+name = "last_alert_signature"
+type = "string"
+initial = ""
+
+[[state]]
+name = "alert_status"
+type = "string"
+initial = ""
+
 [[action]]
 name = "Configure"
 kind = "input"
@@ -97,7 +112,18 @@ from = ["Starting"]
 to = "Failed"
 params = ["last_error", "error_message"]
 hint = "Runtime transport startup failed with a non-retryable error."
-effect = [{ type = "increment", var = "attempt_count" }]
+effect = [
+  { type = "increment", var = "attempt_count" },
+  { type = "trigger", name = "transport_fatal_alert" },
+]
+
+[[action]]
+name = "AlertRecorded"
+kind = "input"
+from = ["Failed"]
+to = "Failed"
+params = ["last_alert_at", "last_alert_signature", "alert_status"]
+hint = "Record that a fatal-transport human alert was delivered (or suppressed for dedupe)."
 
 [[action]]
 name = "MarkDisconnected"
@@ -127,3 +153,21 @@ on_failure = "StartFailed"
 
 [integration.config]
 temper_api_url = "{secret:temper_api_url}"
+
+# Proactive human alert on entering the fatal Failed state. Runs on the
+# StartFailed transition (see its trigger effect). Calls Discord REST directly
+# with the bot token so the alert is deliverable even though the gateway is dead
+# (works for 4014 disallowed-intents; for 4004 bad-token REST is also dead and
+# the message points the human at the dashboard). Dedupe/rate-limit is decided
+# inside the module; on internal failure it advances via AlertRecorded so the
+# entity never gets stuck.
+[[integration]]
+name = "transport_fatal_alert"
+trigger = "transport_fatal_alert"
+type = "wasm"
+module = "transport_fatal_alert"
+on_failure = "AlertRecorded"
+
+[integration.config]
+discord_bot_token = "{secret:discord_bot_token}"
+discord_feed_channel_id = "{secret:discord_feed_channel_id}"
