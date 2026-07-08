@@ -5,7 +5,7 @@
   import { base } from '$app/paths';
   import PawLogo from '$lib/components/PawLogo.svelte';
   import ThemeToggle from '$lib/components/ThemeToggle.svelte';
-  import { fetchSetupStatus, fetchVersion, checkForUpdates, checkEdgeBuild, triggerRedeploy, getRailwayStatus } from '$lib/api';
+  import { fetchSetupStatus, isSetupIncomplete, fetchVersion, checkForUpdates, checkEdgeBuild, triggerRedeploy, getRailwayStatus } from '$lib/api';
   import type { VersionInfo, UpdateCheck, EdgeBuild } from '$lib/api';
   import { getCurrentUser, logout, type SessionUser } from '$lib/auth';
   import { page } from '$app/stores';
@@ -65,12 +65,7 @@
         const onWelcomePage = relativePath($page.url.pathname) === '/welcome';
         if (!onWelcomePage) {
           try {
-            const setupStatus = await fetchSetupStatus();
-            if (
-              !setupStatus.has_anthropic_key
-              || !setupStatus.has_agents
-              || !setupStatus.has_personalized_soul
-            ) {
+            if (isSetupIncomplete(await fetchSetupStatus())) {
               await goto(appHref('/welcome'));
               return;
             }
