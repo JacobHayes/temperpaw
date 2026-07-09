@@ -1756,6 +1756,7 @@ pub async fn run(mut config: Config, force_soul_setup: bool) -> Result<()> {
         tenant: tenant.clone(),
         agents_dir: PathBuf::from("os-apps/paw-agent/agents"),
         base_url: format!("http://127.0.0.1:{actual_port}"),
+        api_key: config.temper_api_key.clone(),
         build_version: config.build_version.clone(),
         build_sha: config.build_sha.clone(),
     };
@@ -2720,10 +2721,27 @@ fn spawn_soul_bootstrap(
     llm_model: String,
     preserve_personalized_paw_soul: bool,
 ) {
+    spawn_soul_bootstrap_for_api_url(
+        format!("http://127.0.0.1:{port}"),
+        tenant,
+        api_key,
+        llm_provider,
+        llm_model,
+        preserve_personalized_paw_soul,
+    );
+}
+
+pub(crate) fn spawn_soul_bootstrap_for_api_url(
+    api_url: String,
+    tenant: String,
+    api_key: Option<String>,
+    llm_provider: String,
+    llm_model: String,
+    preserve_personalized_paw_soul: bool,
+) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let api_url = format!("http://127.0.0.1:{port}");
         let client = reqwest::Client::new();
 
         // Check for personalized Paw soul from `temperpaw setup`

@@ -83,6 +83,8 @@ On server boot, `startup.rs` seeds both `llm_provider` and `llm_model` to the va
 
 The welcome dashboard must save the active provider and provider-aware default model as one setup operation before advancing to soul personalization. Setup status treats the LLM step as incomplete unless credentials, `llm_provider`, and `llm_model` are all present; a credential alone is not enough.
 
+When a setup secret write makes LLM configuration complete and no Agents exist yet, the setup API schedules the same default Agent/Soul bootstrap used at startup. Users should not need a service restart after completing LLM setup.
+
 The `create_agent` API handler reads the vault-resolved provider when no explicit provider is specified in the request, ensuring new agents inherit the platform default.
 
 ## Consequences

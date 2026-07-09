@@ -60,6 +60,7 @@ pub struct SetupApiState {
     pub tenant: String,
     pub agents_dir: PathBuf,
     pub base_url: String,
+    pub api_key: Option<String>,
     pub build_version: String,
     pub build_sha: String,
 }
@@ -549,6 +550,106 @@ fn llm_setup_configured(has_credential: bool, provider: Option<&str>, model: Opt
         && model.is_some_and(|value| !value.trim().is_empty())
 }
 
+fn llm_credential_configured(
+    vault: Option<&Arc<temper_server::secrets::SecretsVault>>,
+    tenant: &str,
+) -> bool {
+    vault
+        .and_then(|v| {
+            v.get_secret(tenant, "anthropic_api_key")
+                .or_else(|| v.get_secret(tenant, "openai_api_key"))
+                .or_else(|| v.get_secret(tenant, OPENAI_CODEX_ACCESS_TOKEN))
+                .or_else(|| v.get_secret(tenant, "openai_codex_token"))
+                .or_else(|| v.get_secret(tenant, "openrouter_api_key"))
+                .or_else(|| v.get_secret(tenant, "huggingface_api_key"))
+                .or_else(|| v.get_secret(tenant, "hf_token"))
+                .or_else(|| v.get_secret(tenant, "fireworks_api_key"))
+                .or_else(|| v.get_secret(tenant, "sakana_fugu_api_key"))
+                .or_else(|| v.get_secret(tenant, "openai_compatible_api_key"))
+                .or_else(|| v.get_secret(tenant, "openai_compatible_api_url"))
+                .or_else(|| v.get_secret(tenant, "local_openai_api_url"))
+        })
+        .is_some()
+}
+
+fn agent_count(state: &SetupApiState) -> usize {
+    let index = state.platform.server.entity_index.read().unwrap();
+    let key = format!("{}:Agent", state.tenant);
+    index.get(&key).map(|set| set.len()).unwrap_or(0)
+}
+
+fn is_llm_bootstrap_secret_key(key: &str) -> bool {
+    matches!(
+        key,
+        "llm_provider"
+            | "llm_model"
+            | "anthropic_api_key"
+            | "openai_api_key"
+            | OPENAI_CODEX_ACCESS_TOKEN
+            | OPENAI_CODEX_REFRESH_TOKEN
+            | OPENAI_CODEX_EXPIRES_AT_MS
+            | OPENAI_CODEX_ACCOUNT_ID
+            | "openai_codex_token"
+            | "openrouter_api_key"
+            | "huggingface_api_key"
+            | "hf_token"
+            | "fireworks_api_key"
+            | "sakana_fugu_api_key"
+            | "openai_compatible_api_key"
+            | "openai_compatible_api_url"
+            | "local_openai_api_url"
+    )
+}
+
+fn should_trigger_agent_bootstrap_after_secret_update(
+    updated_key: &str,
+    llm_configured: bool,
+    agent_count: usize,
+) -> bool {
+    is_llm_bootstrap_secret_key(updated_key) && llm_configured && agent_count == 0
+}
+
+async fn maybe_spawn_agent_bootstrap_after_secret_update(state: &SetupApiState, updated_key: &str) {
+    let Some(vault) = state.platform.server.secrets_vault.as_ref() else {
+        return;
+    };
+    let llm_provider = vault.get_secret(&state.tenant, "llm_provider");
+    let llm_model = vault.get_secret(&state.tenant, "llm_model");
+    let llm_configured = llm_setup_configured(
+        llm_credential_configured(Some(vault), &state.tenant),
+        llm_provider.as_deref(),
+        llm_model.as_deref(),
+    );
+
+    if !should_trigger_agent_bootstrap_after_secret_update(
+        updated_key,
+        llm_configured,
+        agent_count(state),
+    ) {
+        return;
+    }
+
+    let Some(llm_provider) = llm_provider else {
+        return;
+    };
+    let Some(llm_model) = llm_model else {
+        return;
+    };
+    tracing::info!(
+        provider = %llm_provider,
+        model = %llm_model,
+        "Scheduling default agent bootstrap after setup LLM configuration"
+    );
+    crate::startup::spawn_soul_bootstrap_for_api_url(
+        state.base_url.clone(),
+        state.tenant.clone(),
+        state.api_key.clone(),
+        llm_provider,
+        llm_model,
+        persisted_personalized_soul_flag(state),
+    );
+}
+
 fn field_str<'a>(fields: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter()
         .find_map(|key| fields.get(*key).and_then(serde_json::Value::as_str))
@@ -933,22 +1034,7 @@ async fn discord_transport_connection_snapshot(
 async fn get_setup_status(State(state): State<SetupApiState>) -> Json<SetupStatus> {
     let vault = state.platform.server.secrets_vault.as_ref();
 
-    let has_llm_credential = vault
-        .and_then(|v| {
-            v.get_secret(&state.tenant, "anthropic_api_key")
-                .or_else(|| v.get_secret(&state.tenant, "openai_api_key"))
-                .or_else(|| v.get_secret(&state.tenant, OPENAI_CODEX_ACCESS_TOKEN))
-                .or_else(|| v.get_secret(&state.tenant, "openai_codex_token"))
-                .or_else(|| v.get_secret(&state.tenant, "openrouter_api_key"))
-                .or_else(|| v.get_secret(&state.tenant, "huggingface_api_key"))
-                .or_else(|| v.get_secret(&state.tenant, "hf_token"))
-                .or_else(|| v.get_secret(&state.tenant, "fireworks_api_key"))
-                .or_else(|| v.get_secret(&state.tenant, "sakana_fugu_api_key"))
-                .or_else(|| v.get_secret(&state.tenant, "openai_compatible_api_key"))
-                .or_else(|| v.get_secret(&state.tenant, "openai_compatible_api_url"))
-                .or_else(|| v.get_secret(&state.tenant, "local_openai_api_url"))
-        })
-        .is_some();
+    let has_llm_credential = llm_credential_configured(vault, &state.tenant);
     let llm_provider = vault.and_then(|v| v.get_secret(&state.tenant, "llm_provider"));
     let llm_model = vault.and_then(|v| v.get_secret(&state.tenant, "llm_model"));
     let has_anthropic_key = llm_setup_configured(
@@ -961,12 +1047,7 @@ async fn get_setup_status(State(state): State<SetupApiState>) -> Json<SetupStatu
     let has_slack =
         secret_is_configured(vault.and_then(|v| v.get_secret(&state.tenant, "slack_bot_token")));
 
-    // Count agents from entity index
-    let agent_count = {
-        let index = state.platform.server.entity_index.read().unwrap();
-        let key = format!("{}:Agent", state.tenant);
-        index.get(&key).map(|set| set.len()).unwrap_or(0)
-    };
+    let agent_count = agent_count(&state);
 
     let transport_status = state.transport_manager.status().await;
     let discord_connected = matches!(
@@ -1432,6 +1513,8 @@ async fn upsert_secret(
             }
         }
     }
+
+    maybe_spawn_agent_bootstrap_after_secret_update(&state, &req.key).await;
 
     (StatusCode::OK, Json(response))
 }
@@ -3655,7 +3738,8 @@ mod tests {
         discord_readyz_response, discord_start_error_is_retryable,
         genesis_install_request_from_setup, is_discord_ping, llm_setup_configured,
         persist_discord_public_key, personalized_soul_flag_value, secrets_schema,
-        transport_status_report, validate_setup_secret_key, verify_discord_signature,
+        should_trigger_agent_bootstrap_after_secret_update, transport_status_report,
+        validate_setup_secret_key, verify_discord_signature,
     };
     use crate::transport_manager::{DiscordInteractionDelivery, TransportStatus};
     use axum::http::StatusCode;
@@ -4112,6 +4196,45 @@ mod tests {
             false,
             Some("openai_codex"),
             Some("gpt-5.5")
+        ));
+    }
+
+    #[test]
+    fn llm_secret_update_triggers_bootstrap_only_when_complete_and_empty() {
+        assert!(should_trigger_agent_bootstrap_after_secret_update(
+            "llm_provider",
+            true,
+            0
+        ));
+        assert!(should_trigger_agent_bootstrap_after_secret_update(
+            "llm_model",
+            true,
+            0
+        ));
+        assert!(should_trigger_agent_bootstrap_after_secret_update(
+            "openai_codex_access_token",
+            true,
+            0
+        ));
+        assert!(should_trigger_agent_bootstrap_after_secret_update(
+            "openai_codex_account_id",
+            true,
+            0
+        ));
+        assert!(!should_trigger_agent_bootstrap_after_secret_update(
+            "llm_provider",
+            false,
+            0
+        ));
+        assert!(!should_trigger_agent_bootstrap_after_secret_update(
+            "llm_provider",
+            true,
+            4
+        ));
+        assert!(!should_trigger_agent_bootstrap_after_secret_update(
+            "discord_bot_token",
+            true,
+            0
         ));
     }
 
