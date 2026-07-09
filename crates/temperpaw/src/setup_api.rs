@@ -1607,23 +1607,22 @@ async fn resolve_llm_provider(state: &SetupApiState) -> Result<LlmProvider> {
                 .context("Configure openai_compatible_api_url before personalizing Paw")?;
             LlmProvider::openai_compatible(&provider, &api_key, &api_url, &model)
         }
+        "openai_codex" => {
+            let access_token = vault
+                .get_secret(&state.tenant, OPENAI_CODEX_ACCESS_TOKEN)
+                .or_else(|| vault.get_secret(&state.tenant, "openai_codex_token"))
+                .context("Configure openai_codex_access_token before personalizing Paw")?;
+            let account_id = vault.get_secret(&state.tenant, OPENAI_CODEX_ACCOUNT_ID);
+            LlmProvider::openai_codex(&access_token, account_id.as_deref(), &model)
+        }
         _ => {
             let api_key = match provider.as_str() {
                 "anthropic" => vault.get_secret(&state.tenant, "anthropic_api_key"),
                 "openrouter" => vault.get_secret(&state.tenant, "openrouter_api_key"),
                 "openai" => vault.get_secret(&state.tenant, "openai_api_key"),
-                "openai_codex" => vault
-                    .get_secret(&state.tenant, OPENAI_CODEX_ACCESS_TOKEN)
-                    .or_else(|| vault.get_secret(&state.tenant, "openai_codex_token")),
-                _ => [
-                    "anthropic_api_key",
-                    "openrouter_api_key",
-                    "openai_api_key",
-                    OPENAI_CODEX_ACCESS_TOKEN,
-                    "openai_codex_token",
-                ]
-                .into_iter()
-                .find_map(|key| vault.get_secret(&state.tenant, key)),
+                _ => ["anthropic_api_key", "openrouter_api_key", "openai_api_key"]
+                    .into_iter()
+                    .find_map(|key| vault.get_secret(&state.tenant, key)),
             }
             .with_context(|| format!("Configure an LLM API key for provider {provider}"))?;
             LlmProvider::detect(&api_key, &provider, &model)
