@@ -33,6 +33,7 @@ When `llm_model` is not explicitly set, the default is derived from the provider
 |-------------|----------------------------|
 | `anthropic` | `claude-sonnet-4-6`        |
 | `openai`    | `o3-mini`                  |
+| `openai_codex` | `gpt-5.5`              |
 | `openrouter`| `anthropic/claude-sonnet-4`|
 
 The `LLM_MODEL` environment variable overrides these defaults for all providers.
@@ -79,6 +80,8 @@ Platform API route. See ADR-0044.
 ### 5. Startup seeding
 
 On server boot, `startup.rs` seeds both `llm_provider` and `llm_model` to the vault from environment variables. This ensures the vault has values even on first boot before the user reaches the dashboard.
+
+The welcome dashboard must save the active provider and provider-aware default model as one setup operation before advancing to soul personalization. Setup status treats the LLM step as incomplete unless credentials, `llm_provider`, and `llm_model` are all present; a credential alone is not enough.
 
 The `create_agent` API handler reads the vault-resolved provider when no explicit provider is specified in the request, ensuring new agents inherit the platform default.
 

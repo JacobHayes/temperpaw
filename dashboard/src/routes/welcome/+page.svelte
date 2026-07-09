@@ -64,11 +64,32 @@
   let interviewIdeal = $state('');
   let interviewWorkingStyle = $state('');
   let interviewPushback = $state('');
+  const DEFAULT_CODEX_MODEL = 'gpt-5.5';
+  const defaultModelMap: Record<string, string> = {
+    anthropic: 'claude-sonnet-4-6',
+    openai: 'o3-mini',
+    openai_codex: DEFAULT_CODEX_MODEL,
+    openrouter: 'anthropic/claude-sonnet-4',
+  };
   const providerKeyMap: Record<string, string> = {
     anthropic: 'anthropic_api_key',
     openai: 'openai_api_key',
     openrouter: 'openrouter_api_key',
   };
+
+  function defaultModelForProvider(provider: string): string {
+    const model = defaultModelMap[provider];
+    if (!model) throw new Error(`No default model configured for ${provider}`);
+    return model;
+  }
+
+  async function saveActiveLlmConfig(provider: string) {
+    const model = defaultModelForProvider(provider);
+    // Save model before provider so the setup gate never sees a newly-active
+    // provider without the model required by agent bootstrap and soul generation.
+    await saveSecret('llm_model', model);
+    await saveSecret('llm_provider', provider);
+  }
 
   let setupComplete = $derived(
     status?.has_anthropic_key
@@ -116,12 +137,9 @@
     try {
       const secretKey = providerKeyMap[llmProvider];
       await saveSecret(secretKey, key);
-      await saveSecret('llm_provider', llmProvider);
-      status = await fetchSetupStatus();
-      showLlmForm = false;
-      showSoulForm = true;
+      await saveActiveLlmConfig(llmProvider);
+      await llmConfigured();
       llmKey = '';
-      currentSoul = await getCurrentSoul();
     } catch (err) {
       keyError = err instanceof Error ? err.message : 'Failed to save API key';
     } finally {
@@ -132,6 +150,9 @@
   // Mark the LLM step done and move the user along to the soul interview.
   async function llmConfigured() {
     status = await fetchSetupStatus();
+    if (!status.has_anthropic_key) {
+      throw new Error('LLM setup is incomplete: provider, model, and credentials must all be saved.');
+    }
     showLlmForm = false;
     showSoulForm = !status.has_personalized_soul;
     currentSoul = await getCurrentSoul();
@@ -172,7 +193,7 @@
       codexStatus = next;
       if (next.configured) {
         stopCodexBackgroundPoll();
-        await saveSecret('llm_provider', 'openai_codex');
+        await saveActiveLlmConfig('openai_codex');
         await llmConfigured();
         return;
       }
@@ -206,7 +227,7 @@
     savingKey = true;
     keyError = '';
     try {
-      await saveSecret('llm_provider', 'openai_codex');
+      await saveActiveLlmConfig('openai_codex');
       await llmConfigured();
     } catch (err) {
       keyError = err instanceof Error ? err.message : 'Failed to set provider';

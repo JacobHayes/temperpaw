@@ -308,6 +308,7 @@ export async function fetchFileContent(fileId: string): Promise<string> {
 export interface SetupStatus {
   has_anthropic_key: boolean;
   llm_provider: string | null;
+  llm_model: string | null;
   has_discord: boolean;
   has_slack: boolean;
   has_agents: boolean;

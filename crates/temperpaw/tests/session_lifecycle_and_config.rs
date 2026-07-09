@@ -143,6 +143,25 @@ fn runtime_model_provider_selection_has_no_hardcoded_llm_fallbacks() {
 }
 
 #[test]
+fn welcome_codex_setup_saves_provider_and_model_atomically() {
+    let root = repo_root();
+    let welcome = read(root.join("dashboard/src/routes/welcome/+page.svelte"));
+
+    assert!(
+        welcome.contains("const DEFAULT_CODEX_MODEL = 'gpt-5.5'"),
+        "welcome Codex setup should define the provider-aware model default"
+    );
+    assert!(
+        welcome.contains("saveActiveLlmConfig('openai_codex')"),
+        "welcome Codex setup should save provider+model through one helper"
+    );
+    assert!(
+        !welcome.contains("saveSecret('llm_provider', 'openai_codex')"),
+        "welcome must not mark Codex active without also saving llm_model"
+    );
+}
+
+#[test]
 fn session_spec_uses_provider_specific_llm_secrets_and_urls() {
     let root = repo_root();
     let spec = read(root.join("os-apps/paw-agent/specs/session.ioa.toml"));

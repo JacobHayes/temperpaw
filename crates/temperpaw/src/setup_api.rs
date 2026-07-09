@@ -480,6 +480,7 @@ pub fn router(state: SetupApiState) -> Router {
 struct SetupStatus {
     has_anthropic_key: bool,
     llm_provider: Option<String>,
+    llm_model: Option<String>,
     has_discord: bool,
     has_slack: bool,
     has_agents: bool,
@@ -540,6 +541,12 @@ struct TransportConnectionSnapshot {
 
 fn secret_is_configured(value: Option<String>) -> bool {
     value.is_some_and(|value| !value.trim().is_empty())
+}
+
+fn llm_setup_configured(has_credential: bool, provider: Option<&str>, model: Option<&str>) -> bool {
+    has_credential
+        && provider.is_some_and(|value| !value.trim().is_empty())
+        && model.is_some_and(|value| !value.trim().is_empty())
 }
 
 fn field_str<'a>(fields: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
@@ -926,7 +933,7 @@ async fn discord_transport_connection_snapshot(
 async fn get_setup_status(State(state): State<SetupApiState>) -> Json<SetupStatus> {
     let vault = state.platform.server.secrets_vault.as_ref();
 
-    let has_anthropic_key = vault
+    let has_llm_credential = vault
         .and_then(|v| {
             v.get_secret(&state.tenant, "anthropic_api_key")
                 .or_else(|| v.get_secret(&state.tenant, "openai_api_key"))
@@ -943,6 +950,12 @@ async fn get_setup_status(State(state): State<SetupApiState>) -> Json<SetupStatu
         })
         .is_some();
     let llm_provider = vault.and_then(|v| v.get_secret(&state.tenant, "llm_provider"));
+    let llm_model = vault.and_then(|v| v.get_secret(&state.tenant, "llm_model"));
+    let has_anthropic_key = llm_setup_configured(
+        has_llm_credential,
+        llm_provider.as_deref(),
+        llm_model.as_deref(),
+    );
     let has_discord =
         secret_is_configured(vault.and_then(|v| v.get_secret(&state.tenant, "discord_bot_token")));
     let has_slack =
@@ -974,6 +987,7 @@ async fn get_setup_status(State(state): State<SetupApiState>) -> Json<SetupStatu
     Json(SetupStatus {
         has_anthropic_key,
         llm_provider,
+        llm_model,
         has_discord,
         has_slack,
         has_agents: agent_count > 0,
@@ -3639,9 +3653,9 @@ mod tests {
         InstallFromGenesisRequest, allowed_secret_keys, datadog_enhanced_app_railway_vars,
         datadog_runtime_agent_railway_vars, discord_connect_params_for_secret_update,
         discord_readyz_response, discord_start_error_is_retryable,
-        genesis_install_request_from_setup, is_discord_ping, persist_discord_public_key,
-        personalized_soul_flag_value, secrets_schema, transport_status_report,
-        validate_setup_secret_key, verify_discord_signature,
+        genesis_install_request_from_setup, is_discord_ping, llm_setup_configured,
+        persist_discord_public_key, personalized_soul_flag_value, secrets_schema,
+        transport_status_report, validate_setup_secret_key, verify_discord_signature,
     };
     use crate::transport_manager::{DiscordInteractionDelivery, TransportStatus};
     use axum::http::StatusCode;
@@ -4083,6 +4097,22 @@ mod tests {
         assert!(validate_setup_secret_key("../oops").is_err());
         assert!(validate_setup_secret_key(" bad").is_err());
         assert!(validate_setup_secret_key("bad/key").is_err());
+    }
+
+    #[test]
+    fn llm_setup_requires_credentials_provider_and_model() {
+        assert!(llm_setup_configured(
+            true,
+            Some("openai_codex"),
+            Some("gpt-5.5")
+        ));
+        assert!(!llm_setup_configured(true, Some("openai_codex"), None));
+        assert!(!llm_setup_configured(true, None, Some("gpt-5.5")));
+        assert!(!llm_setup_configured(
+            false,
+            Some("openai_codex"),
+            Some("gpt-5.5")
+        ));
     }
 
     #[test]
