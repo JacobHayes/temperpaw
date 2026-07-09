@@ -194,6 +194,36 @@ fn canvas_empty_state_talk_to_paw_opens_chat_panel() {
 }
 
 #[test]
+fn dashboard_session_creation_copies_agent_runtime_config() {
+    let root = repo_root();
+    let api = read(root.join("dashboard/src/lib/api.ts"));
+
+    assert!(
+        api.contains("async function resolveSessionAgentConfig"),
+        "dashboard createSession should resolve the Agent runtime template before Session.Configure"
+    );
+    assert!(
+        api.contains("getEntity('Agents', params.agent_id)"),
+        "dashboard createSession should load the selected Agent entity"
+    );
+
+    for needle in [
+        "model: agentConfig.model",
+        "provider: agentConfig.provider",
+        "provider_options_json: agentConfig.providerOptionsJson",
+        "temperature: agentConfig.temperature",
+        "tools_enabled: agentConfig.toolsEnabled",
+        "max_turns: agentConfig.maxTurns",
+        "soul_id: agentConfig.soulId",
+    ] {
+        assert!(
+            api.contains(needle),
+            "Session.Configure body should include Agent-derived `{needle}`"
+        );
+    }
+}
+
+#[test]
 fn setup_status_agent_count_uses_durable_lazy_index() {
     let root = repo_root();
     let setup_api = read(root.join("crates/temperpaw/src/setup_api.rs"));

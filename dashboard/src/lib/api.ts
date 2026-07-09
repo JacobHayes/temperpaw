@@ -57,6 +57,17 @@ function entityResource(entitySet: string, id: string): string {
   return `${entitySet}('${escapeODataString(id)}')`;
 }
 
+function stringField(row: Record<string, unknown>, keys: string[]): string {
+  const fields = (row.fields ?? {}) as Record<string, unknown>;
+  for (const key of keys) {
+    const value = row[key] ?? fields[key];
+    if (value === null || value === undefined) continue;
+    const text = String(value).trim();
+    if (text) return text;
+  }
+  return '';
+}
+
 export async function queryEntities(
   entitySet: string,
   filter?: string,
@@ -679,11 +690,58 @@ export async function triggerRedeploy(imageTag?: 'latest' | 'edge'): Promise<voi
 
 // ──────────────────── Chat / Session API ────────────────────
 
+interface SessionAgentConfig {
+  model: string;
+  provider: string;
+  providerOptionsJson: string;
+  temperature: string;
+  toolsEnabled: string;
+  maxTurns: string;
+  soulId: string;
+}
+
+async function resolveSessionAgentConfig(params: {
+  agent_id: string;
+  model?: string;
+  provider?: string;
+  provider_options_json?: string;
+  temperature?: string;
+  tools_enabled?: string;
+  max_turns?: string;
+  soul_id?: string;
+}): Promise<SessionAgentConfig> {
+  const agent = await getEntity('Agents', params.agent_id);
+  const model = (params.model ?? stringField(agent, ['model', 'Model'])).trim();
+  const provider = (params.provider ?? stringField(agent, ['provider', 'Provider'])).trim();
+
+  if (!model) throw new Error(`Agent ${params.agent_id} has no configured model`);
+  if (!provider) throw new Error(`Agent ${params.agent_id} has no configured provider`);
+
+  return {
+    model,
+    provider,
+    providerOptionsJson: params.provider_options_json ?? stringField(agent, ['provider_options_json', 'ProviderOptionsJson']),
+    temperature: (params.temperature ?? stringField(agent, ['temperature', 'Temperature'])) || '1.0',
+    toolsEnabled: params.tools_enabled ?? stringField(agent, ['tools_enabled', 'ToolsEnabled']),
+    maxTurns: (params.max_turns ?? stringField(agent, ['max_turns', 'MaxTurns'])) || '200',
+    soulId: params.soul_id ?? stringField(agent, ['soul_id', 'SoulId']),
+  };
+}
+
 export async function createSession(params: {
   agent_id: string;
   user_message: string;
   system_prompt?: string;
+  model?: string;
+  provider?: string;
+  provider_options_json?: string;
+  temperature?: string;
+  tools_enabled?: string;
+  max_turns?: string;
+  soul_id?: string;
 }): Promise<{ session_id: string }> {
+  const agentConfig = await resolveSessionAgentConfig(params);
+
   // Create session entity
   const res = await apiFetch(`${BASE}/tdata/Sessions`, {
     method: 'POST',
@@ -695,14 +753,24 @@ export async function createSession(params: {
   const sessionId = data.entity_id || data.fields?.Id || data.Id;
 
   // Configure it — which kicks off the WASM-driven loop
+  const configureBody: Record<string, unknown> = {
+    agent_id: params.agent_id,
+    user_message: params.user_message,
+    system_prompt: params.system_prompt || '',
+    model: agentConfig.model,
+    provider: agentConfig.provider,
+    provider_options_json: agentConfig.providerOptionsJson,
+    temperature: agentConfig.temperature,
+    tools_enabled: agentConfig.toolsEnabled,
+    max_turns: agentConfig.maxTurns,
+    soul_id: agentConfig.soulId,
+  };
+  if (!agentConfig.toolsEnabled) delete configureBody.tools_enabled;
+
   const configRes = await apiFetch(`${BASE}/tdata/Sessions('${sessionId}')/TemperPaw.Configure`, {
     method: 'POST',
     headers: { ...HEADERS, 'content-type': 'application/json' },
-    body: JSON.stringify({
-      agent_id: params.agent_id,
-      user_message: params.user_message,
-      system_prompt: params.system_prompt || '',
-    }),
+    body: JSON.stringify(configureBody),
   });
   if (!configRes.ok) throw new Error(`Configure session failed: ${configRes.status}`);
 
