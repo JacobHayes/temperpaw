@@ -175,6 +175,25 @@ fn welcome_codex_setup_saves_provider_and_model_atomically() {
 }
 
 #[test]
+fn canvas_empty_state_talk_to_paw_opens_chat_panel() {
+    let root = repo_root();
+    let canvas = read(root.join("dashboard/src/routes/+page.svelte"));
+
+    assert!(
+        canvas.contains("openPanel") && canvas.contains("from '$lib/stores/paw-chat'"),
+        "Canvas page should import the Paw chat panel opener"
+    );
+    assert!(
+        canvas.contains("onclick={openPanel}"),
+        "Canvas empty-state Talk to Paw control should open the Paw chat panel"
+    );
+    assert!(
+        !canvas.contains("href=\"{base}/welcome\" class=\"empty-link\">Talk to Paw"),
+        "Canvas empty-state Talk to Paw must not route completed setup users back to /welcome"
+    );
+}
+
+#[test]
 fn setup_status_agent_count_uses_durable_lazy_index() {
     let root = repo_root();
     let setup_api = read(root.join("crates/temperpaw/src/setup_api.rs"));

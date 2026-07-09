@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { base } from '$app/paths';
   import { SvelteFlow, Background, MiniMap, Controls } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
 
@@ -9,6 +8,7 @@
   import { refreshSession } from '$lib/stores/sessions';
   import { updateAgentSessions } from '$lib/stores/canvas';
   import { fetchAgentSessions } from '$lib/stores/agents';
+  import { openPanel } from '$lib/stores/paw-chat';
   import { queryEntities, queryTeams, queryAgentsForTeam } from '$lib/api';
   import type { Node, Edge, NodeTypes } from '@xyflow/svelte';
   import type { CanvasNodeData } from '$lib/canvas-types';
@@ -229,7 +229,7 @@
       <div class="canvas-empty">
         <span class="empty-label">CANVAS</span>
         <span class="empty-text">No activity yet. Agents will appear here when sessions are running.</span>
-        <a href="{base}/welcome" class="empty-link">Talk to Paw</a>
+        <button type="button" class="empty-link" onclick={openPanel}>Talk to Paw</button>
       </div>
     {/if}
   {:else}
@@ -312,6 +312,10 @@
     color: var(--accent);
     text-decoration: none;
     margin-top: var(--sp-1);
+    padding: 0;
+    background: none;
+    border: 0;
+    cursor: pointer;
   }
 
   .empty-link:hover {
