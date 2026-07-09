@@ -10,6 +10,19 @@ fn read(path: impl AsRef<Path>) -> String {
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.as_ref().display()))
 }
 
+fn rust_sources_under(dir: &Path) -> Vec<PathBuf> {
+    let mut sources = Vec::new();
+    for entry in fs::read_dir(dir).unwrap_or_else(|err| panic!("failed to read {dir:?}: {err}")) {
+        let path = entry.expect("directory entry").path();
+        if path.is_dir() {
+            sources.extend(rust_sources_under(&path));
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            sources.push(path);
+        }
+    }
+    sources
+}
+
 #[test]
 fn session_link_is_a_reusable_temperpaw_child_session_monitor() {
     let root = repo_root();
@@ -159,6 +172,38 @@ fn welcome_codex_setup_saves_provider_and_model_atomically() {
         !welcome.contains("saveSecret('llm_provider', 'openai_codex')"),
         "welcome must not mark Codex active without also saving llm_model"
     );
+}
+
+#[test]
+fn setup_status_agent_count_uses_durable_lazy_index() {
+    let root = repo_root();
+    let setup_api = read(root.join("crates/temperpaw/src/setup_api.rs"));
+
+    assert!(
+        setup_api.contains("async fn agent_count(state: &SetupApiState) -> usize"),
+        "setup status must compute Agent count through an async durable read path"
+    );
+    assert!(
+        setup_api.contains(".list_entity_ids_lazy(&tenant_id, \"Agent\")"),
+        "setup status must use Temper's durable lazy list, not a raw in-memory entity_index read"
+    );
+    assert!(
+        !setup_api.contains("fn agent_count(state: &SetupApiState) -> usize {\n    let index = state.platform.server.entity_index.read().unwrap();"),
+        "setup status must not treat entity_index as durable truth before hydration"
+    );
+}
+
+#[test]
+fn temperpaw_runtime_source_does_not_read_entity_index_directly() {
+    let root = repo_root();
+    for path in rust_sources_under(&root.join("crates/temperpaw/src")) {
+        let source = read(&path);
+        assert!(
+            !source.contains("entity_index.read("),
+            "{} must use list_entity_ids_lazy/populate helpers instead of direct entity_index reads",
+            path.strip_prefix(&root).unwrap_or(&path).display()
+        );
+    }
 }
 
 #[test]

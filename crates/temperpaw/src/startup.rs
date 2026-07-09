@@ -718,20 +718,10 @@ async fn recover_orphaned_sessions(state: &PlatformState, tenant: &str) {
     .into_iter()
     .collect();
     let tenant_id = TenantId::new(tenant);
-    state
+    let session_ids: Vec<String> = state
         .server
-        .populate_index_from_store_by_type(&tenant_id, "Session")
+        .list_entity_ids_lazy(&tenant_id, "Session")
         .await;
-    let session_ids: Vec<String> = {
-        let index = state.server.entity_index.read().unwrap(); // ci-ok: infallible lock
-        let index_key = format!("{tenant_id}:Session");
-        index
-            .get(&index_key)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .collect()
-    };
     if session_ids.len() > recovery_limit {
         tracing::warn!(
             tenant,

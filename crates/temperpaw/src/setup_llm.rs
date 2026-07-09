@@ -319,7 +319,7 @@ fn build_openai_codex_responses_body(
     model: &str,
     system: &str,
     user_msg: &str,
-    max_tokens: u32,
+    _max_tokens: u32,
 ) -> Value {
     json!({
         "model": model,
@@ -328,9 +328,12 @@ fn build_openai_codex_responses_body(
             "role": "user",
             "content": user_msg,
         }],
-        "max_output_tokens": max_tokens,
         "stream": true,
         "store": false,
+        "reasoning": {
+            "effort": "medium",
+            "summary": "auto",
+        },
     })
 }
 
@@ -456,13 +459,32 @@ fn collect_codex_sse_output(body: &str) -> Value {
 }
 
 fn response_error_message(body: &str) -> Option<String> {
-    let parsed = serde_json::from_str::<Value>(body).ok()?;
-    parsed
-        .get("error")
-        .and_then(|error| error.get("message"))
-        .and_then(Value::as_str)
-        .or_else(|| parsed.get("message").and_then(Value::as_str))
-        .map(str::to_string)
+    if let Ok(parsed) = serde_json::from_str::<Value>(body) {
+        if let Some(message) = parsed
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .or_else(|| parsed.get("message").and_then(Value::as_str))
+        {
+            return Some(message.to_string());
+        }
+    }
+
+    response_body_snippet(body)
+}
+
+fn response_body_snippet(body: &str) -> Option<String> {
+    const MAX_ERROR_BODY_SNIPPET_CHARS: usize = 512;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut snippet: String = trimmed.chars().take(MAX_ERROR_BODY_SNIPPET_CHARS).collect();
+    if trimmed.chars().count() > MAX_ERROR_BODY_SNIPPET_CHARS {
+        snippet.push_str("…");
+    }
+    Some(snippet)
 }
 
 fn extract_chatgpt_account_id_from_jwt(token: &str) -> Option<String> {
@@ -500,6 +522,34 @@ mod provider_tests {
     fn aliases_normalize_to_codex_provider_hint() {
         assert_eq!(normalize_provider_hint("codex"), "openai_codex");
         assert_eq!(normalize_provider_hint("openai-codex"), "openai_codex");
+    }
+
+    #[test]
+    fn codex_setup_request_matches_subscription_responses_contract() {
+        let body = build_openai_codex_responses_body("gpt-5.5", "system", "hello", 1024);
+
+        assert_eq!(body["model"], "gpt-5.5");
+        assert_eq!(body["instructions"], "system");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["reasoning"]["effort"], "medium");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert!(
+            body.get("max_output_tokens").is_none(),
+            "ChatGPT/Codex subscription responses reject the public Responses max_output_tokens field"
+        );
+    }
+
+    #[test]
+    fn codex_error_message_falls_back_to_body_snippet() {
+        assert_eq!(
+            response_error_message("unsupported field: max_output_tokens").as_deref(),
+            Some("unsupported field: max_output_tokens")
+        );
+
+        let msg = response_error_message(r#"{"detail":"bad request"}"#)
+            .expect("JSON error without error.message should still be surfaced");
+        assert!(msg.contains("bad request"));
     }
 }
 

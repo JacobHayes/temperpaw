@@ -350,62 +350,147 @@ fn entity_field_str<'a>(entity: &'a serde_json::Value, field_names: &[&str]) -> 
     })
 }
 
+fn entity_id_from_json(entity: &serde_json::Value) -> Option<&str> {
+    entity["entity_id"]
+        .as_str()
+        .or_else(|| entity["fields"]["Id"].as_str())
+        .or_else(|| entity["fields"]["id"].as_str())
+        .or_else(|| entity["Id"].as_str())
+        .or_else(|| entity["id"].as_str())
+}
+
+fn apply_setup_odata_headers(
+    request: reqwest::RequestBuilder,
+    tenant: &str,
+    auth: &SetupRequestAuth,
+) -> reqwest::RequestBuilder {
+    auth.apply(request)
+        .header("x-tenant-id", tenant)
+        .header("x-temper-principal-kind", "admin")
+}
+
+async fn odata_json_response(
+    response: reqwest::Response,
+    context: impl AsRef<str>,
+) -> anyhow::Result<serde_json::Value> {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("{} failed ({status}): {body}", context.as_ref());
+    }
+    serde_json::from_str(&body)
+        .with_context(|| format!("{} returned invalid JSON", context.as_ref()))
+}
+
+async fn odata_get_json(
+    client: &reqwest::Client,
+    url: &str,
+    tenant: &str,
+    auth: &SetupRequestAuth,
+) -> anyhow::Result<serde_json::Value> {
+    let response = apply_setup_odata_headers(client.get(url), tenant, auth)
+        .send()
+        .await?;
+    odata_json_response(response, format!("GET {url}")).await
+}
+
+async fn odata_post_json(
+    client: &reqwest::Client,
+    url: &str,
+    tenant: &str,
+    auth: &SetupRequestAuth,
+    body: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let response = apply_setup_odata_headers(client.post(url), tenant, auth)
+        .json(&body)
+        .send()
+        .await?;
+    odata_json_response(response, format!("POST {url}")).await
+}
+
+async fn odata_post_json_expect_success(
+    client: &reqwest::Client,
+    url: &str,
+    tenant: &str,
+    auth: &SetupRequestAuth,
+    body: serde_json::Value,
+) -> anyhow::Result<()> {
+    let response = apply_setup_odata_headers(client.post(url), tenant, auth)
+        .json(&body)
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("POST {url} failed ({status}): {body}");
+    }
+    Ok(())
+}
+
+async fn odata_post_empty(
+    client: &reqwest::Client,
+    url: &str,
+    tenant: &str,
+    auth: &SetupRequestAuth,
+) -> anyhow::Result<()> {
+    odata_post_json_expect_success(client, url, tenant, auth, serde_json::json!({})).await
+}
+
+async fn get_active_paw_agent(
+    client: &reqwest::Client,
+    base: &str,
+    tenant: &str,
+    auth: &SetupRequestAuth,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let agent_url = format!("{base}/tdata/Agents?$filter=name eq 'Paw' and Status eq 'Active'");
+    let agent_response = odata_get_json(client, &agent_url, tenant, auth).await?;
+    Ok(agent_response["value"]
+        .as_array()
+        .and_then(|items| items.first())
+        .cloned())
+}
+
+async fn find_paw_soul_entity(
+    client: &reqwest::Client,
+    base: &str,
+    tenant: &str,
+    auth: &SetupRequestAuth,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    if let Some(agent) = get_active_paw_agent(client, base, tenant, auth).await?
+        && let Some(soul_id) = entity_field_str(&agent, &["soul_id", "SoulId"])
+    {
+        let soul_url = format!("{base}/tdata/Souls('{soul_id}')");
+        let soul_response = odata_get_json(client, &soul_url, tenant, auth).await?;
+
+        if entity_field_str(&soul_response, &["ContentFileId", "content_file_id"]).is_some() {
+            return Ok(Some(soul_response));
+        }
+    }
+
+    for filter in ["Name eq 'Paw'", "name eq 'paw'"] {
+        let soul_url = format!("{base}/tdata/Souls?$filter={filter}");
+        let soul_response = odata_get_json(client, &soul_url, tenant, auth).await?;
+
+        if let Some(soul) = soul_response["value"]
+            .as_array()
+            .and_then(|items| items.first())
+        {
+            return Ok(Some(soul.clone()));
+        }
+    }
+
+    Ok(None)
+}
+
 async fn resolve_paw_soul_entity(
     client: &reqwest::Client,
     base: &str,
     tenant: &str,
     auth: &SetupRequestAuth,
 ) -> anyhow::Result<serde_json::Value> {
-    let agent_url = format!("{base}/tdata/Agents?$filter=name eq 'Paw' and Status eq 'Active'");
-    let agent_response: serde_json::Value = auth
-        .apply(client.get(&agent_url))
-        .header("x-tenant-id", tenant)
-        .header("x-temper-principal-kind", "admin")
-        .send()
+    find_paw_soul_entity(client, base, tenant, auth)
         .await?
-        .json()
-        .await?;
-
-    if let Some(agent) = agent_response["value"]
-        .as_array()
-        .and_then(|items| items.first())
-        && let Some(soul_id) = entity_field_str(agent, &["soul_id", "SoulId"])
-    {
-        let soul_url = format!("{base}/tdata/Souls('{soul_id}')");
-        let soul_response: serde_json::Value = auth
-            .apply(client.get(&soul_url))
-            .header("x-tenant-id", tenant)
-            .header("x-temper-principal-kind", "admin")
-            .send()
-            .await?
-            .json()
-            .await?;
-
-        if entity_field_str(&soul_response, &["ContentFileId", "content_file_id"]).is_some() {
-            return Ok(soul_response);
-        }
-    }
-
-    for filter in ["Name eq 'Paw'", "name eq 'paw'"] {
-        let soul_url = format!("{base}/tdata/Souls?$filter={filter}");
-        let soul_response: serde_json::Value = auth
-            .apply(client.get(&soul_url))
-            .header("x-tenant-id", tenant)
-            .header("x-temper-principal-kind", "admin")
-            .send()
-            .await?
-            .json()
-            .await?;
-
-        if let Some(soul) = soul_response["value"]
-            .as_array()
-            .and_then(|items| items.first())
-        {
-            return Ok(soul.clone());
-        }
-    }
-
-    anyhow::bail!("Paw Soul entity not found");
+        .context("Paw Soul entity not found")
 }
 
 pub(crate) async fn load_paw_soul_content(
@@ -465,35 +550,29 @@ pub(crate) fn has_local_personalized_paw_soul() -> bool {
     generated_paw_soul_paths().iter().any(|path| path.exists())
 }
 
-/// Write the generated soul content to the existing Paw Soul entity in TemperFS.
-pub(crate) async fn save_soul_to_temper(
-    client: &reqwest::Client,
-    base: &str,
-    tenant: &str,
-    soul: &GeneratedSoul,
-    auth: &SetupRequestAuth,
-) -> anyhow::Result<()> {
-    let paw = resolve_paw_soul_entity(client, base, tenant, auth).await?;
-    let file_id = entity_field_str(&paw, &["ContentFileId", "content_file_id"])
-        .ok_or_else(|| anyhow::anyhow!("Paw Soul has no ContentFileId"))?;
-
+fn generated_paw_soul_content(soul: &GeneratedSoul) -> String {
     // Concatenate soul + style + user + the default AGENT.md (operational instructions)
     let agent_md =
         std::fs::read_to_string("os-apps/paw-agent/agents/paw/AGENT.md").unwrap_or_default();
 
-    let full_content = format!(
+    format!(
         "{}\n\n{}\n\n{}\n\n{}",
         soul.soul_md, soul.style_md, soul.user_md, agent_md
-    );
+    )
+}
 
-    // Upload to TemperFS via PUT $value
+async fn upload_paw_soul_content(
+    client: &reqwest::Client,
+    base: &str,
+    tenant: &str,
+    auth: &SetupRequestAuth,
+    file_id: &str,
+    content: String,
+) -> anyhow::Result<()> {
     let upload_url = format!("{base}/tdata/Files('{file_id}')/$value");
-    let resp = auth
-        .apply(client.put(&upload_url))
-        .header("x-tenant-id", tenant)
-        .header("x-temper-principal-kind", "admin")
+    let resp = apply_setup_odata_headers(client.put(&upload_url), tenant, auth)
         .header("content-type", "text/markdown")
-        .body(full_content)
+        .body(content)
         .send()
         .await?;
 
@@ -504,6 +583,102 @@ pub(crate) async fn save_soul_to_temper(
     }
 
     Ok(())
+}
+
+async fn create_and_attach_paw_soul(
+    client: &reqwest::Client,
+    base: &str,
+    tenant: &str,
+    soul: &GeneratedSoul,
+    auth: &SetupRequestAuth,
+    full_content: String,
+) -> anyhow::Result<()> {
+    let agent = get_active_paw_agent(client, base, tenant, auth)
+        .await?
+        .context("Paw Agent entity not found")?;
+    let agent_id = entity_id_from_json(&agent)
+        .context("Paw Agent entity missing Id")?
+        .to_string();
+
+    let file_resp = odata_post_json(
+        client,
+        &format!("{base}/tdata/Files"),
+        tenant,
+        auth,
+        serde_json::json!({
+            "Name": "Paw.soul.md",
+            "MimeType": "text/markdown"
+        }),
+    )
+    .await
+    .context("Failed to create Paw soul file")?;
+    let file_id = entity_id_from_json(&file_resp)
+        .context("File creation did not return Id")?
+        .to_string();
+
+    upload_paw_soul_content(client, base, tenant, auth, &file_id, full_content)
+        .await
+        .context("Failed to upload Paw soul content")?;
+
+    let soul_resp = odata_post_json(
+        client,
+        &format!("{base}/tdata/Souls"),
+        tenant,
+        auth,
+        serde_json::json!({
+            "Name": "Paw",
+            "Description": soul.summary,
+            "ContentFileId": file_id,
+            "AuthorId": "setup"
+        }),
+    )
+    .await
+    .context("Failed to create Paw Soul entity")?;
+    let soul_id = entity_id_from_json(&soul_resp)
+        .context("Soul creation did not return Id")?
+        .to_string();
+
+    odata_post_empty(
+        client,
+        &format!("{base}/tdata/Souls('{soul_id}')/TemperPaw.Publish"),
+        tenant,
+        auth,
+    )
+    .await
+    .context("Failed to publish Paw Soul entity")?;
+
+    odata_post_json_expect_success(
+        client,
+        &format!("{base}/tdata/Agents('{agent_id}')/TemperPaw.Update"),
+        tenant,
+        auth,
+        serde_json::json!({ "soul_id": soul_id }),
+    )
+    .await
+    .context("Failed to attach Paw Soul to Agent")?;
+
+    Ok(())
+}
+
+/// Write the generated soul content to the Paw Soul entity in TemperFS.
+pub(crate) async fn save_soul_to_temper(
+    client: &reqwest::Client,
+    base: &str,
+    tenant: &str,
+    soul: &GeneratedSoul,
+    auth: &SetupRequestAuth,
+) -> anyhow::Result<()> {
+    let full_content = generated_paw_soul_content(soul);
+
+    let Some(paw) = find_paw_soul_entity(client, base, tenant, auth).await? else {
+        return create_and_attach_paw_soul(client, base, tenant, soul, auth, full_content).await;
+    };
+
+    let Some(file_id) = entity_field_str(&paw, &["ContentFileId", "content_file_id"]) else {
+        return create_and_attach_paw_soul(client, base, tenant, soul, auth, full_content).await;
+    };
+
+    upload_paw_soul_content(client, base, tenant, auth, file_id, full_content).await
 }
 
 /// Merge Phase A results into config.
@@ -785,6 +960,145 @@ mod tests {
                     && body.contains("# User"))
                 .unwrap_or(false)
         );
+    }
+
+    #[tokio::test]
+    async fn save_soul_to_temper_creates_and_attaches_missing_paw_soul() {
+        #[derive(Clone, Default)]
+        struct SeenRequests {
+            created_files: Arc<Mutex<Vec<serde_json::Value>>>,
+            uploaded_content: Arc<Mutex<Vec<String>>>,
+            created_souls: Arc<Mutex<Vec<serde_json::Value>>>,
+            agent_updates: Arc<Mutex<Vec<serde_json::Value>>>,
+        }
+
+        async fn handler(
+            State(state): State<SeenRequests>,
+            request: Request<Body>,
+        ) -> impl IntoResponse {
+            match (
+                request.method(),
+                request.uri().path(),
+                request.uri().query(),
+            ) {
+                (&Method::GET, "/tdata/Agents", _) => (
+                    StatusCode::OK,
+                    axum::Json(json!({
+                        "value": [{
+                            "entity_id": "agent-1",
+                            "fields": {
+                                "name": "Paw"
+                            }
+                        }]
+                    })),
+                )
+                    .into_response(),
+                (&Method::GET, "/tdata/Souls", _) => (
+                    StatusCode::OK,
+                    axum::Json(json!({
+                        "value": []
+                    })),
+                )
+                    .into_response(),
+                (&Method::POST, "/tdata/Files", _) => {
+                    let body = to_bytes(request.into_body(), usize::MAX).await.unwrap();
+                    state
+                        .created_files
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(&body).unwrap());
+                    (
+                        StatusCode::OK,
+                        axum::Json(json!({
+                            "entity_id": "file-1"
+                        })),
+                    )
+                        .into_response()
+                }
+                (&Method::PUT, "/tdata/Files('file-1')/$value", _) => {
+                    let body = to_bytes(request.into_body(), usize::MAX).await.unwrap();
+                    state
+                        .uploaded_content
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8(body.to_vec()).unwrap());
+                    StatusCode::OK.into_response()
+                }
+                (&Method::POST, "/tdata/Souls", _) => {
+                    let body = to_bytes(request.into_body(), usize::MAX).await.unwrap();
+                    state
+                        .created_souls
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(&body).unwrap());
+                    (
+                        StatusCode::OK,
+                        axum::Json(json!({
+                            "entity_id": "soul-1"
+                        })),
+                    )
+                        .into_response()
+                }
+                (&Method::POST, "/tdata/Souls('soul-1')/TemperPaw.Publish", _) => {
+                    StatusCode::OK.into_response()
+                }
+                (&Method::POST, "/tdata/Agents('agent-1')/TemperPaw.Update", _) => {
+                    let body = to_bytes(request.into_body(), usize::MAX).await.unwrap();
+                    state
+                        .agent_updates
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(&body).unwrap());
+                    StatusCode::OK.into_response()
+                }
+                _ => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+
+        let seen = SeenRequests::default();
+        let app = Router::new()
+            .fallback(any(handler))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let soul = GeneratedSoul {
+            summary: "Thoughtful collaborator".to_string(),
+            soul_md: "# Soul".to_string(),
+            style_md: "# Style".to_string(),
+            user_md: "# User".to_string(),
+        };
+
+        save_soul_to_temper(
+            &reqwest::Client::new(),
+            &format!("http://{addr}"),
+            "default",
+            &soul,
+            &SetupRequestAuth::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(seen.created_files.lock().unwrap().len(), 1);
+        assert_eq!(seen.created_files.lock().unwrap()[0]["Name"], "Paw.soul.md");
+        assert_eq!(
+            seen.created_files.lock().unwrap()[0]["MimeType"],
+            "text/markdown"
+        );
+        assert!(
+            seen.uploaded_content.lock().unwrap()[0].contains("# Soul")
+                && seen.uploaded_content.lock().unwrap()[0].contains("# Style")
+                && seen.uploaded_content.lock().unwrap()[0].contains("# User")
+        );
+        assert_eq!(seen.created_souls.lock().unwrap()[0]["Name"], "Paw");
+        assert_eq!(
+            seen.created_souls.lock().unwrap()[0]["ContentFileId"],
+            "file-1"
+        );
+        assert_eq!(seen.agent_updates.lock().unwrap()[0]["soul_id"], "soul-1");
     }
 
     #[tokio::test]

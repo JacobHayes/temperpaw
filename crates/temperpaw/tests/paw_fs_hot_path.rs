@@ -285,6 +285,18 @@ fn paw_fs_file_policy_allows_value_upload_update_on_direct_hot_path() {
 }
 
 #[test]
+fn paw_fs_file_policy_allows_admin_setup_bootstrap_writes() {
+    let policy = repo_file("os-apps/paw-fs/policies/file.cedar");
+    assert!(
+        policy.contains("principal is Admin")
+            && policy.contains("resource is File")
+            && policy.contains("Action::\"create\"")
+            && policy.contains("Action::\"StreamUpdated\""),
+        "setup and startup bootstrap run as Admin and must be able to create File metadata and upload content"
+    );
+}
+
+#[test]
 fn artifact_batch_apply_returns_explicit_success_to_wasm_host() {
     let source = repo_file("os-apps/paw-fs/wasm/artifact_batch_apply/src/lib.rs");
     assert!(

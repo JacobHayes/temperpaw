@@ -7,6 +7,16 @@ permit(
     resource is File
 );
 
+// Setup and startup bootstrap run through authenticated Admin requests while
+// installing default agent souls and saving the personalized Paw soul. They
+// need the same File metadata/content authority that Soul policies already give
+// Admins for the referencing Soul entity.
+permit(
+    principal is Admin,
+    action in [Action::"create", Action::"Create", Action::"update", Action::"StreamUpdated"],
+    resource is File
+);
+
 // Session tool reads (temper.read) authorize content access through a
 // family of capitalized action names relayed as service:wasm-runtime —
 // without this permit every session file read dies in WaitingForApproval

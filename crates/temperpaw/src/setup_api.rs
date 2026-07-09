@@ -572,10 +572,14 @@ fn llm_credential_configured(
         .is_some()
 }
 
-fn agent_count(state: &SetupApiState) -> usize {
-    let index = state.platform.server.entity_index.read().unwrap();
-    let key = format!("{}:Agent", state.tenant);
-    index.get(&key).map(|set| set.len()).unwrap_or(0)
+async fn agent_count(state: &SetupApiState) -> usize {
+    let tenant_id = TenantId::new(&state.tenant);
+    state
+        .platform
+        .server
+        .list_entity_ids_lazy(&tenant_id, "Agent")
+        .await
+        .len()
 }
 
 fn is_llm_bootstrap_secret_key(key: &str) -> bool {
@@ -585,9 +589,6 @@ fn is_llm_bootstrap_secret_key(key: &str) -> bool {
             | "llm_model"
             | "anthropic_api_key"
             | "openai_api_key"
-            | OPENAI_CODEX_ACCESS_TOKEN
-            | OPENAI_CODEX_REFRESH_TOKEN
-            | OPENAI_CODEX_EXPIRES_AT_MS
             | OPENAI_CODEX_ACCOUNT_ID
             | "openai_codex_token"
             | "openrouter_api_key"
@@ -624,7 +625,7 @@ async fn maybe_spawn_agent_bootstrap_after_secret_update(state: &SetupApiState, 
     if !should_trigger_agent_bootstrap_after_secret_update(
         updated_key,
         llm_configured,
-        agent_count(state),
+        agent_count(state).await,
     ) {
         return;
     }
@@ -1047,7 +1048,7 @@ async fn get_setup_status(State(state): State<SetupApiState>) -> Json<SetupStatu
     let has_slack =
         secret_is_configured(vault.and_then(|v| v.get_secret(&state.tenant, "slack_bot_token")));
 
-    let agent_count = agent_count(&state);
+    let agent_count = agent_count(&state).await;
 
     let transport_status = state.transport_manager.status().await;
     let discord_connected = matches!(
@@ -4211,8 +4212,18 @@ mod tests {
             true,
             0
         ));
-        assert!(should_trigger_agent_bootstrap_after_secret_update(
+        assert!(!should_trigger_agent_bootstrap_after_secret_update(
             "openai_codex_access_token",
+            true,
+            0
+        ));
+        assert!(!should_trigger_agent_bootstrap_after_secret_update(
+            "openai_codex_refresh_token",
+            true,
+            0
+        ));
+        assert!(!should_trigger_agent_bootstrap_after_secret_update(
+            "openai_codex_expires_at_ms",
             true,
             0
         ));
