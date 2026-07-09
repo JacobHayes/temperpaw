@@ -1,15 +1,19 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { base } from '$app/paths';
   import {
     fetchSetupStatus,
+    fetchOpenAICodexStatus,
     generateSoulPreview,
     getCurrentSoul,
+    pollOpenAICodexDeviceLogin,
     saveGeneratedSoul,
     saveSecret,
     getSecret,
+    startOpenAICodexDeviceLogin,
     type CurrentSoul,
     type GeneratedSoul,
+    type OpenAICodexAuthStatus,
     type SetupStatus,
     type UserInterview,
   } from '$lib/api';
@@ -25,6 +29,27 @@
   let savingKey = $state(false);
   let keyError = $state('');
   let showLlmForm = $state(false);
+
+  // Codex device-code sign-in, run right here instead of bouncing to Settings.
+  let codexStatus = $state<OpenAICodexAuthStatus | null>(null);
+  let codexStarting = $state(false);
+  let codexPolling = $state(false);
+  let codexPollTimer: ReturnType<typeof setInterval> | null = null;
+  let codexPollDeadlineMs = 0;
+  const CODEX_POLL_INTERVAL_MS = 5000; // backend advertises poll_interval_ms=5000
+  const CODEX_POLL_MAX_WALL_MS = 15 * 60 * 1000; // hard stop after 15 min
+
+  // Entity states where a device code is pending user authorization.
+  const CODEX_PENDING_STATES = ['Starting', 'DeviceCodeReady', 'Polling'];
+  // Set once the code's expiry passes; the backend entity keeps the stale code,
+  // so this flag hides it and re-enables the sign-in button for a fresh one.
+  let codexExpired = $state(false);
+  let codexAwaitingCode = $derived(
+    !codexExpired
+      && !!codexStatus?.user_code
+      && !codexStatus.configured
+      && CODEX_PENDING_STATES.includes(codexStatus.status ?? '')
+  );
 
   // Soul personalization
   let currentSoul = $state<CurrentSoul | null>(null);
@@ -65,6 +90,7 @@
   onMount(async () => {
     try {
       status = await fetchSetupStatus();
+      codexStatus = await fetchOpenAICodexStatus().catch(() => null);
 
       if (status.has_anthropic_key) {
         // Detect active provider
@@ -83,11 +109,6 @@
   });
 
   async function saveLlmKey() {
-    if (llmProvider === 'openai_codex') {
-      await saveSecret('llm_provider', llmProvider);
-      keyError = 'Use Settings to sign in with OpenAI Codex.';
-      return;
-    }
     const key = llmKey.trim();
     if (!key) return;
     savingKey = true;
@@ -107,6 +128,108 @@
       savingKey = false;
     }
   }
+
+  // Mark the LLM step done and move the user along to the soul interview.
+  async function llmConfigured() {
+    status = await fetchSetupStatus();
+    showLlmForm = false;
+    showSoulForm = !status.has_personalized_soul;
+    currentSoul = await getCurrentSoul();
+  }
+
+  function codexExpiryMs(): number {
+    const raw = codexStatus?.expires_at_ms;
+    const parsed = raw ? Number(raw) : NaN;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+
+  function stopCodexBackgroundPoll() {
+    if (codexPollTimer !== null) {
+      clearInterval(codexPollTimer);
+      codexPollTimer = null;
+    }
+  }
+
+  function startCodexBackgroundPoll() {
+    stopCodexBackgroundPoll();
+    const cap = Date.now() + CODEX_POLL_MAX_WALL_MS;
+    const expiry = codexExpiryMs();
+    codexPollDeadlineMs = expiry > 0 ? Math.min(expiry, cap) : cap;
+    codexPollTimer = setInterval(() => { void codexBackgroundTick(); }, CODEX_POLL_INTERVAL_MS);
+  }
+
+  async function codexBackgroundTick() {
+    if (codexPolling) return; // don't overlap in-flight polls
+    if (Date.now() >= codexPollDeadlineMs) {
+      stopCodexBackgroundPoll();
+      codexExpired = true;
+      keyError = 'OpenAI Codex device code expired. Sign in again for a fresh code.';
+      return;
+    }
+    codexPolling = true;
+    try {
+      const next = await pollOpenAICodexDeviceLogin();
+      codexStatus = next;
+      if (next.configured) {
+        stopCodexBackgroundPoll();
+        await saveSecret('llm_provider', 'openai_codex');
+        await llmConfigured();
+        return;
+      }
+      if (next.status === 'Failed') {
+        stopCodexBackgroundPoll();
+        keyError = next.last_error || 'OpenAI Codex sign-in failed';
+      }
+    } catch {
+      // Transient poll errors: keep retrying until the deadline.
+    } finally {
+      codexPolling = false;
+    }
+  }
+
+  async function startCodexSignin() {
+    codexStarting = true;
+    keyError = '';
+    try {
+      codexStatus = await startOpenAICodexDeviceLogin();
+      codexExpired = false;
+      if (codexStatus.user_code) startCodexBackgroundPoll();
+    } catch (err) {
+      keyError = err instanceof Error ? err.message : 'OpenAI Codex sign-in failed';
+    } finally {
+      codexStarting = false;
+    }
+  }
+
+  // Codex is already signed in (e.g. from Settings): just make it the active provider.
+  async function useCodex() {
+    savingKey = true;
+    keyError = '';
+    try {
+      await saveSecret('llm_provider', 'openai_codex');
+      await llmConfigured();
+    } catch (err) {
+      keyError = err instanceof Error ? err.message : 'Failed to set provider';
+    } finally {
+      savingKey = false;
+    }
+  }
+
+  // Resume polling if a device-code flow is already pending when the page
+  // loads — unless the code already expired, in which case unlock sign-in.
+  $effect(() => {
+    if (!codexAwaitingCode) return;
+    const expiry = codexExpiryMs();
+    if (expiry > 0 && Date.now() >= expiry) {
+      codexExpired = true;
+      return;
+    }
+    if (codexPollTimer === null) startCodexBackgroundPoll();
+  });
+
+  onDestroy(() => {
+    stopCodexBackgroundPoll();
+  });
 
   async function refresh() {
     status = await fetchSetupStatus();
@@ -220,9 +343,26 @@
               <button class="tab" class:tab-active={llmProvider === 'openrouter'} onclick={() => llmProvider = 'openrouter'} type="button">OpenRouter</button>
             </div>
             {#if llmProvider === 'openai_codex'}
-              <div class="input-row">
-                <a class="btn" href="{base}/settings">Open Codex sign in</a>
-              </div>
+              {#if codexStatus?.configured}
+                <div class="input-row">
+                  <button class="btn" type="button" onclick={useCodex} disabled={savingKey}>
+                    {savingKey ? '...' : 'Use Codex'}
+                  </button>
+                </div>
+                <p class="step-hint">Codex is already signed in — this makes it the active provider.</p>
+              {:else if codexAwaitingCode}
+                <div class="codex-block">
+                  <span class="codex-code">{codexStatus?.user_code}</span>
+                  <a href={codexStatus?.verification_url} target="_blank" rel="noreferrer">{codexStatus?.verification_url}</a>
+                  <span class="step-hint">Open the link, enter the code, and authorize — checking automatically every 5s.</span>
+                </div>
+              {:else}
+                <div class="input-row">
+                  <button class="btn" type="button" onclick={startCodexSignin} disabled={codexStarting}>
+                    {codexStarting ? 'Requesting code…' : 'Sign in with Codex'}
+                  </button>
+                </div>
+              {/if}
             {:else}
               <div class="input-row">
                 <input type="password" bind:value={llmKey} placeholder="API key" disabled={savingKey} />
@@ -569,8 +709,35 @@
   }
 
   .tab:last-child { border-right: none; }
-  .tab:hover { color: var(--text-1); }
+  /* Scope hover to inactive tabs: the active tab's background IS --text-1, so
+     the generic hover recolor would make its label invisible. */
+  .tab:not(.tab-active):hover { color: var(--text-1); }
   .tab-active { background: var(--text-1); color: var(--bg); }
+
+  .codex-block {
+    display: grid;
+    gap: var(--sp-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--sp-3);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+  }
+
+  .codex-code {
+    font-size: var(--text-sm);
+    letter-spacing: 0.15em;
+    color: var(--text-1);
+  }
+
+  .codex-block a {
+    color: var(--text-2);
+    word-break: break-all;
+  }
+
+  .codex-block .step-hint {
+    padding-left: 0;
+  }
 
   .input-row {
     display: flex;

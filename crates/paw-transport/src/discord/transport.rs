@@ -16,8 +16,46 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::Instrument;
 
+use super::backoff::{
+    Backoff, CloseAction, IDENTIFY_BUDGET_SAFETY_THRESHOLD, IdentifyBudget, capped_budget_wait,
+    classify_close_code, classify_identify_budget, reconnect_delay,
+};
 use super::gateway::*;
 use super::types::*;
+
+/// Outcome of a single gateway connection lifecycle, used by the reconnect loop
+/// to decide whether (and how fast) to reconnect.
+enum GatewayOutcome {
+    /// Reconnect and attempt to RESUME the existing session.
+    Reconnect,
+    /// Reconnect, but abandon the session and send a fresh IDENTIFY.
+    Reidentify,
+    /// A retryable transport/protocol error occurred — back off, then retry.
+    Retryable(String),
+    /// Permanent failure (bad token, disallowed intents, ...). Do not reconnect;
+    /// surface to the operator.
+    Fatal(String),
+}
+
+/// What handling a single gateway payload asks the connection loop to do.
+enum PayloadOutcome {
+    /// Keep reading frames on the current connection.
+    Continue,
+    /// Close and reconnect, resuming the session.
+    Reconnect,
+    /// Close and reconnect with a fresh IDENTIFY (session no longer valid).
+    Reidentify,
+}
+
+/// Cheap, dependency-free jitter source in `[0, 1)` for backoff.
+fn jitter_rand01() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    (nanos % 1_000_000) as f64 / 1_000_000.0
+}
 use crate::{
     PawApiClient, apply_current_trace_context, approval_body_for_scope, approval_scope_from_action,
     fetch_pending_decision,
@@ -1020,36 +1058,103 @@ impl DiscordTransport {
         }
 
         // Phase 3: Connect to Discord Gateway.
-        let gateway_url = fetch_gateway_url(&self.http, &self.config.bot_token).await?;
+        let gateway_bot = fetch_gateway_bot(&self.http, &self.config.bot_token).await?;
+        let gateway_url = gateway_bot.url.clone();
         tracing::info!(gateway_url = %gateway_url, "discord gateway url fetched");
 
+        // Defense-in-depth: if Discord already reports the identify (session
+        // start) budget as spent, do NOT hammer IDENTIFY — that is exactly what
+        // gets a bot penalized / its token reset. Wait for the reset window
+        // (capped so we never block for hours) and surface a clear warning.
+        // This is on top of the per-IDENTIFY 1–5s pacing in `reconnect_delay`.
+        if let Some(limit) = gateway_bot.session_start_limit
+            && let IdentifyBudget::Exhausted { wait } = classify_identify_budget(
+                limit.remaining,
+                Duration::from_millis(limit.reset_after),
+                IDENTIFY_BUDGET_SAFETY_THRESHOLD,
+            )
+        {
+            let applied = capped_budget_wait(wait);
+            tracing::warn!(
+                remaining = limit.remaining,
+                total = limit.total,
+                reset_after_ms = limit.reset_after,
+                applied_wait_ms = applied.as_millis() as u64,
+                "discord identify (session start) budget is near exhaustion; \
+                 waiting before IDENTIFY to avoid a token reset"
+            );
+            tokio::time::sleep(applied).await;
+        }
+
         // Phase 4: Event loop with reconnection.
-        let mut backoff = Duration::from_secs(1);
-        let mut url = format!("{gateway_url}/?v=10&encoding=json");
+        //
+        // Backoff/jitter and IDENTIFY pacing here are load-bearing: without them
+        // a bad or partly-configured bot (invalid token → close 4004, disallowed
+        // intents → 4014, or a session Discord keeps invalidating → op 9) would
+        // hot-loop IDENTIFY thousands of times and get its token reset by Discord.
+        let base_url = format!("{gateway_url}/?v=10&encoding=json");
+        let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
 
         loop {
-            match self.connect_and_run(&url).await {
-                Ok(()) => backoff = Duration::from_secs(1),
-                Err(e) => {
-                    tracing::warn!(
-                        gateway_url = %url,
-                        backoff_secs = backoff.as_secs(),
-                        error = %e,
-                        "discord gateway loop failed"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(60));
-                }
-            }
+            // Resume when we still hold a session; otherwise (re-)IDENTIFY fresh.
+            // A fresh IDENTIFY must respect Discord's identify rate limit.
+            let session = self.gateway.session_id.read().await.clone();
+            let will_identify = session.is_none();
+            let url = match (&session, self.gateway.resume_url.read().await.clone()) {
+                (Some(_), Some(resume)) => format!("{resume}/?v=10&encoding=json"),
+                _ => base_url.clone(),
+            };
+
+            // Pace the attempt. On the very first pass backoff is at its base and
+            // there is no session, so the identify floor applies — never instant.
+            let backoff_delay = backoff.advance();
+            let delay = reconnect_delay(will_identify, backoff_delay, jitter_rand01());
+            tracing::info!(
+                gateway_url = %url,
+                will_identify,
+                delay_ms = delay.as_millis() as u64,
+                "discord gateway (re)connecting"
+            );
+            tokio::time::sleep(delay).await;
+
+            let session_ready = Arc::new(AtomicBool::new(false));
+            let outcome = match self.connect_and_run(&url, &session_ready).await {
+                Ok(outcome) => outcome,
+                // Any I/O or protocol error surfaced via `?` is retryable.
+                Err(error) => GatewayOutcome::Retryable(error),
+            };
 
             // Flush cursor before reconnecting so it survives if we crash.
             self.flush_cursor().await;
 
-            if let Some(resume) = self.gateway.resume_url.read().await.as_ref() {
-                url = format!("{resume}/?v=10&encoding=json");
+            match outcome {
+                GatewayOutcome::Fatal(error) => {
+                    // Do NOT reconnect. Surface to the operator (this bubbles up
+                    // to TransportStatus::Error and the setup/reconcile flow).
+                    tracing::error!(
+                        error = %error,
+                        "discord gateway hit a fatal, non-retryable failure; not reconnecting"
+                    );
+                    return Err(error);
+                }
+                GatewayOutcome::Reidentify => {
+                    // Session is gone — drop it so we re-IDENTIFY on reconnect.
+                    *self.gateway.session_id.write().await = None;
+                }
+                GatewayOutcome::Reconnect => {}
+                GatewayOutcome::Retryable(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "discord gateway loop failed; will reconnect with backoff"
+                    );
+                }
             }
 
-            tracing::info!(gateway_url = %url, "discord reconnecting");
+            // A session that reached READY and then dropped reconnects promptly;
+            // one that never stabilized keeps escalating backoff to avoid a hot loop.
+            if session_ready.load(Ordering::SeqCst) {
+                backoff.reset();
+            }
         }
     }
 
@@ -1541,7 +1646,16 @@ impl DiscordTransport {
     }
 
     /// Connect to Gateway and run the event loop.
-    async fn connect_and_run(&self, url: &str) -> Result<(), String> {
+    ///
+    /// Returns `Ok(GatewayOutcome::{Reconnect,Reidentify,Fatal})` for outcomes
+    /// the loop must distinguish, or `Err(String)` for a retryable failure.
+    /// `session_ready` is flipped to `true` once READY is received so the
+    /// reconnect loop can reset backoff for a session that actually stabilized.
+    async fn connect_and_run(
+        &self,
+        url: &str,
+        session_ready: &AtomicBool,
+    ) -> Result<GatewayOutcome, String> {
         let (ws, _) = tokio_tungstenite::connect_async(url)
             .await
             .map_err(|e| format!("WebSocket connect failed: {e}"))?;
@@ -1598,20 +1712,38 @@ impl DiscordTransport {
                     };
                     let frame = frame.map_err(|e| format!("WebSocket read error: {e}"))?;
                     if let Message::Close(close) = &frame {
+                        let code = close.as_ref().map(|frame| u16::from(frame.code));
                         let reason = close
                             .as_ref()
                             .map(|frame| format!("code={} reason={}", frame.code, frame.reason))
                             .unwrap_or_else(|| "no close frame".to_string());
-                        return Err(format!("Discord gateway closed: {reason}"));
+                        // A missing close code is treated as a plain resumable drop.
+                        return Ok(match code.map(classify_close_code) {
+                            Some(CloseAction::Fatal) => GatewayOutcome::Fatal(format!(
+                                "Discord gateway closed with a fatal, non-retryable code: {reason}. \
+                                 Check the bot token and that required Gateway Intents are enabled \
+                                 in the Discord Developer Portal."
+                            )),
+                            Some(CloseAction::Reidentify) => {
+                                tracing::warn!(%reason, "discord gateway closed; session invalid, will re-identify");
+                                GatewayOutcome::Reidentify
+                            }
+                            _ => {
+                                tracing::info!(%reason, "discord gateway closed; will reconnect");
+                                GatewayOutcome::Reconnect
+                            }
+                        });
                     }
                     let Some(payload) = parse_frame(frame)? else {
                         continue;
                     };
-                    let should_reconnect = self
-                        .handle_payload(payload, &awaiting_heartbeat_ack)
-                        .await?;
-                    if should_reconnect {
-                        return Ok(());
+                    match self
+                        .handle_payload(payload, &awaiting_heartbeat_ack, session_ready)
+                        .await?
+                    {
+                        PayloadOutcome::Continue => {}
+                        PayloadOutcome::Reconnect => return Ok(GatewayOutcome::Reconnect),
+                        PayloadOutcome::Reidentify => return Ok(GatewayOutcome::Reidentify),
                     }
                 }
                 Some(()) = heartbeat_rx.recv() => {
@@ -1641,7 +1773,8 @@ impl DiscordTransport {
         &self,
         payload: GatewayPayload,
         awaiting_heartbeat_ack: &AtomicBool,
-    ) -> Result<bool, String> {
+        session_ready: &AtomicBool,
+    ) -> Result<PayloadOutcome, String> {
         if let Some(s) = payload.s {
             self.gateway.sequence.store(s, Ordering::Relaxed);
         }
@@ -1654,6 +1787,9 @@ impl DiscordTransport {
                         if let Some(d) = payload.d {
                             handle_ready(&self.gateway, d).await?;
                         }
+                        // Mark the session as stabilized so the reconnect loop
+                        // resets its backoff.
+                        session_ready.store(true, Ordering::SeqCst);
                         if let Some(ready_signal) = self.ready_signal.as_ref() {
                             let _ = ready_signal.send(true);
                         }
@@ -1672,25 +1808,28 @@ impl DiscordTransport {
                     }
                     _ => {}
                 }
-                Ok(false)
+                Ok(PayloadOutcome::Continue)
             }
             Some(GatewayOpcode::HeartbeatAck) => {
                 awaiting_heartbeat_ack.store(false, Ordering::SeqCst);
-                Ok(false)
+                Ok(PayloadOutcome::Continue)
             }
             Some(GatewayOpcode::Reconnect) => {
                 tracing::info!("discord gateway requested reconnect");
-                Ok(true)
+                Ok(PayloadOutcome::Reconnect)
             }
             Some(GatewayOpcode::InvalidSession) => {
                 let resumable = payload.d.and_then(|v| v.as_bool()).unwrap_or(false);
-                if !resumable {
-                    *self.gateway.session_id.write().await = None;
-                }
                 tracing::warn!(resumable, "discord gateway reported an invalid session");
-                Ok(true)
+                if resumable {
+                    Ok(PayloadOutcome::Reconnect)
+                } else {
+                    // Session cannot be resumed — the loop clears it and the
+                    // paced re-IDENTIFY respects the identify rate limit.
+                    Ok(PayloadOutcome::Reidentify)
+                }
             }
-            _ => Ok(false),
+            _ => Ok(PayloadOutcome::Continue),
         }
     }
 

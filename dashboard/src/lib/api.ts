@@ -349,6 +349,19 @@ export async function fetchSetupStatus(): Promise<SetupStatus> {
   return res.json();
 }
 
+/**
+ * Whether first-run setup is still incomplete and the user should be routed to
+ * the `/welcome` setup screen. Single source of truth for the setup gate, shared
+ * by the root layout (hard page load) and the login flow (client-side navigation
+ * after signup/login) so both behave identically.
+ *
+ * Note: Discord is intentionally excluded — it is an optional step, so a missing
+ * Discord connection does not by itself force the setup screen.
+ */
+export function isSetupIncomplete(status: SetupStatus): boolean {
+  return !status.has_anthropic_key || !status.has_agents || !status.has_personalized_soul;
+}
+
 export async function fetchOpenAICodexStatus(): Promise<OpenAICodexAuthStatus> {
   const res = await apiFetch(`${BASE}/paw/setup/openai-codex/status`);
   if (!res.ok) throw new Error(`OpenAI Codex status failed: ${res.status}`);

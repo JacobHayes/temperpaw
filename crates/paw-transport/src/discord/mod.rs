@@ -9,6 +9,7 @@
 
 pub mod types;
 
+mod backoff;
 mod gateway;
 mod observer;
 mod transport;

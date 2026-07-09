@@ -3,6 +3,7 @@
   import { base } from '$app/paths';
   import { onMount } from 'svelte';
   import { getAuthProviders, login, register } from '$lib/auth';
+  import { fetchSetupStatus, isSetupIncomplete } from '$lib/api';
 
   let mode = $state<'login' | 'register'>('login');
   let email = $state('');
@@ -46,7 +47,18 @@
       } else {
         await login(email, password);
       }
-      await goto(`${base}/`);
+      // Client-side navigation after auth does not re-run the root layout's
+      // onMount setup gate, so consult setup status here and land on the setup
+      // screen when incomplete — matching the behavior after a hard reload.
+      let destination = `${base}/`;
+      try {
+        if (isSetupIncomplete(await fetchSetupStatus())) {
+          destination = `${base}/welcome`;
+        }
+      } catch {
+        // If setup status can't be loaded, fall through to the dashboard.
+      }
+      await goto(destination);
     } catch (err) {
       error = err instanceof Error ? err.message : 'Authentication failed';
     } finally {

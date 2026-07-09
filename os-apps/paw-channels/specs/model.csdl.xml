@@ -52,6 +52,9 @@
         <Property Name="InteractionUrl" Type="Edm.String"/>
         <Property Name="LastConnectedAt" Type="Edm.String"/>
         <Property Name="AttemptCount" Type="Edm.Int64"/>
+        <Property Name="LastAlertAt" Type="Edm.String"/>
+        <Property Name="LastAlertSignature" Type="Edm.String"/>
+        <Property Name="AlertStatus" Type="Edm.String"/>
       </EntityType>
 
       <Action Name="Configure" IsBound="true">
@@ -246,6 +249,14 @@
         <Parameter Name="bindingParameter" Type="Paw.Channel.TransportConnection"/>
         <Parameter Name="last_error" Type="Edm.String" Nullable="false"/>
         <Parameter Name="next_retry_at" Type="Edm.String" Nullable="true"/>
+        <ReturnType Type="Paw.Channel.TransportConnection"/>
+      </Action>
+
+      <Action Name="AlertRecorded" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Paw.Channel.TransportConnection"/>
+        <Parameter Name="last_alert_at" Type="Edm.String" Nullable="true"/>
+        <Parameter Name="last_alert_signature" Type="Edm.String" Nullable="true"/>
+        <Parameter Name="alert_status" Type="Edm.String" Nullable="true"/>
         <ReturnType Type="Paw.Channel.TransportConnection"/>
       </Action>
 
