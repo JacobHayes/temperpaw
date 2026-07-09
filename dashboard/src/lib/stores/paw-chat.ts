@@ -3,6 +3,10 @@ import { createSession, steerSession, getEntity, queryEntities } from '$lib/api'
 import { createSSEConnection, closeSSEConnection, type StateChangeEvent } from '$lib/sse';
 import { eventsToTurns, type SessionTurn } from '$lib/parse';
 import type { EntityEvent } from '$lib/types';
+import {
+  fetchTerminalSessionSnapshot,
+  missingCompletedResultMessage,
+} from './paw-chat-terminal';
 
 export interface PawMessage {
   id: string;
@@ -109,7 +113,10 @@ function connectToSession(sessionId: string): void {
       const messages = [...s.messages];
       const lastMsg = messages[messages.length - 1];
       if (lastMsg && lastMsg.role === 'assistant' && lastMsg.status !== 'completed') {
-        messages[messages.length - 1] = { ...lastMsg, status: mapStatusToMessage(event.status) };
+        const nextStatus = event.status === 'Completed'
+          ? lastMsg.status ?? 'executing'
+          : mapStatusToMessage(event.status);
+        messages[messages.length - 1] = { ...lastMsg, status: nextStatus };
       }
 
       return { ...s, status: newStatus, messages };
@@ -154,11 +161,16 @@ async function refetchSessionEvents(sessionId: string): Promise<void> {
 /** Handle terminal session state — extract result or error */
 async function finishSession(sessionId: string, entityStatus: string): Promise<void> {
   try {
-    const entity = await getEntity('Sessions', sessionId);
-    const result = (entity.result as string) || '';
-    const errorMessage = (entity.error_message as string) || '';
-    const rawEvents = (entity._events ?? []) as EntityEvent[];
+    const snapshot = await fetchTerminalSessionSnapshot(
+      sessionId,
+      entityStatus,
+      (id) => getEntity('Sessions', id)
+    );
+    const result = snapshot.result;
+    const errorMessage = snapshot.errorMessage;
+    const rawEvents = snapshot.rawEvents as EntityEvent[];
     const turns = eventsToTurns(rawEvents);
+    const completedWithoutResult = entityStatus === 'Completed' && !result;
 
     pawChat.update((s) => {
       const messages = [...s.messages];
@@ -167,10 +179,10 @@ async function finishSession(sessionId: string, entityStatus: string): Promise<v
       if (lastMsg && lastMsg.role === 'assistant') {
         messages[messages.length - 1] = {
           ...lastMsg,
-          content: result || lastMsg.content,
+          content: result || lastMsg.content || (completedWithoutResult ? missingCompletedResultMessage(sessionId) : ''),
           turns,
           status: entityStatus === 'Completed' ? 'completed' : 'failed',
-          errorMessage: errorMessage || undefined,
+          errorMessage: errorMessage || (completedWithoutResult ? 'Completed Session result was not visible in the read model after waiting.' : undefined),
         };
       } else if (entityStatus === 'Completed' && result) {
         messages.push({
@@ -346,18 +358,26 @@ export async function restoreFromServer(): Promise<void> {
       connectToSession(state.sessionId);
     } else {
       // Session is terminal — make sure we have the result
-      const result = (entity.result as string) || '';
+      const snapshot = await fetchTerminalSessionSnapshot(
+        state.sessionId,
+        entityStatus,
+        (id) => getEntity('Sessions', id)
+      );
+      const result = snapshot.result;
       const lastMsg = state.messages[state.messages.length - 1];
-      if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.content && result) {
+      if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.content) {
         pawChat.update((s) => {
           const messages = [...s.messages];
           messages[messages.length - 1] = {
             ...lastMsg,
-            content: result,
-            status: 'completed',
+            content: result || (entityStatus === 'Completed' ? missingCompletedResultMessage(state.sessionId!) : lastMsg.content),
+            status: entityStatus === 'Completed' ? 'completed' : 'failed',
+            errorMessage: snapshot.errorMessage || undefined,
           };
-          return { ...s, messages, status: 'idle' };
+          return { ...s, messages, status: entityStatus === 'Completed' ? 'idle' : 'error' };
         });
+      } else {
+        pawChat.update((s) => ({ ...s, status: entityStatus === 'Completed' ? 'idle' : 'error' }));
       }
     }
   } catch {
